@@ -1,0 +1,286 @@
+[
+ {
+  "id": "B1-01",
+  "topic": "lake-setup",
+  "q": "We want an on-prem data lake under 40 TB. How would you set up the object storage layer for it?",
+  "mid": "I would run an S3-compatible store on dedicated storage nodes and put Iceberg tables on it through a REST catalog. Buckets follow zones: landing for raw files as received, bronze, silver and gold as Iceberg warehouses, plus separate buckets for WORM records, scratch and logs. Each engine gets its own service account scoped to the prefixes it needs, and data files target around 512 MB with scheduled compaction.",
+  "senior": "I would size the cluster by failure domains and throughput more than capacity: EC 4+2 needs six hosts and a seventh to self-heal, and 80 TB logical at 1.5x with a 70% fill ceiling (a rule of thumb; Ceph itself warns at 85%) is about 171 TB raw. NVMe goes to every metadata tier (bucket index, filer database, catalog Postgres) and to compute-node caches. Maintenance (compaction, snapshot expiry, orphan cleanup) is an owned, monitored service from day one, and the store is chosen only after a POC that pulls a disk and a node under load.",
+  "followups": [
+   {
+    "q": "Why separate storage and compute nodes at this size?",
+    "a": "Otherwise rebuilds, deep scrubs and compaction compete with queries for CPU and disk, and one host failure takes out a query node and storage chunks together. Separate nodes also let the team add compute for quarter-end without touching storage; engine-local NVMe caches recover most of the locality."
+   },
+   {
+    "q": "Is the 40 TB raw or compressed?",
+    "a": "I would ask. Source data usually shrinks a lot as Parquet with zstd, which changes the disk count; if 40 TB is already compressed, plan from it directly. Either way, size for growth plus rebuild headroom."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B1-02",
+  "topic": "object-storage",
+  "q": "An earlier design used MinIO. Would you still use it?",
+  "mid": "I would correct that. MinIO stopped publishing community binaries and Docker images in October 2025, put the repository into maintenance mode in December 2025 and archived it on 25 April 2026; the README now points to the commercial AIStor product. The last community image is from September 2025, so nobody upstream patches the community edition.",
+  "senior": "The real options are AIStor under a commercial licence, a third-party rebuild such as Chainguard's image or the pgsty fork where the team owns patching, or a different store. For a compliance-driven firm that wants no lock-in I would compare Ceph RGW (mature, heavier to run) and SeaweedFS (lighter, with a built-in Iceberg REST catalog), and pilot RustFS. Because the engines speak only S3 and Iceberg REST, the choice is reversible at the cost of a bulk copy.",
+  "followups": [
+   {
+    "q": "What is AIStor Free?",
+    "a": "Per MinIO's README it is a full-featured standalone edition under a free licence; the distributed edition is AIStor Enterprise with commercial support. The README lists no free distributed edition (as of Oct 2026)."
+   },
+   {
+    "q": "What lesson do you take from it?",
+    "a": "Check an open-source dependency's governance and funding as well as its features, and keep to the common S3 subset so a move stays cheap. MinIO went from open source to archived in about a year."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B1-03",
+  "topic": "object-storage",
+  "q": "Why do we need a table format like Iceberg at all? Why not just Parquet files in folders on object storage?",
+  "mid": "Object storage has no rename and no append, and consistency is per key, so a job that writes 300 files cannot make them appear at once. Hive-style tables commit by renaming a directory, which on S3 is a copy and delete per object and can fail halfway. Iceberg records the exact file list in metadata and commits by atomically swapping one pointer in the catalog, so readers always see whole snapshots.",
+  "senior": "It also takes LIST out of query planning: planners read manifests with per-file statistics, which is what makes millions of files workable on object storage. You get optimistic concurrency (HTTP 409 and retry on conflict), time travel and schema evolution. The price is that metadata and maintenance become the team's: compaction, snapshot expiry, orphan cleanup, and a catalog that is critical infrastructure needing backups and high availability.",
+  "followups": [
+   {
+    "q": "Doesn't S3 support rename now?",
+    "a": "Only S3 Express One Zone directory buckets: append arrived in November 2024 and atomic RenameObject in June 2025. General-purpose buckets and on-prem S3 APIs have neither, and Iceberg relies on neither."
+   },
+   {
+    "q": "What happens when two writers commit at the same time?",
+    "a": "Both write their own files under unique names and then try to swap the pointer. The catalog accepts one; the other gets a conflict, re-reads the new metadata, checks its change still applies and retries, four times by default in Iceberg Java."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B1-04",
+  "topic": "lake-setup",
+  "q": "What file sizes do you target in the lake, and how do you deal with small files?",
+  "mid": "Roughly 128 MB to 1 GB Parquet files; Iceberg's Java default target is 512 MB with 128 MB row groups. Small files cost a request and a footer read each, bloat manifests and slow planning, so I would batch writes and run compaction after the market closes.",
+  "senior": "Most small-file problems are design choices: commit frequency times partition count equals file count. For ticks I would partition by day, sort by symbol inside files, commit every few minutes or keep intraday data in the MPP engine, then sort-compact nightly, expire snapshots and rewrite manifests. Orphan cleanup thresholds stay longer than the longest write, and all of it runs as monitored Prefect flows.",
+  "followups": [
+   {
+    "q": "What runs compaction on-prem?",
+    "a": "Spark's rewrite_data_files, Trino's optimize, StarRocks' compaction API from 4.0, or SeaweedFS table buckets server-side. PyIceberg 0.12.0 lists compaction as planned, so it cannot be the compaction engine yet (as of Oct 2026)."
+   },
+   {
+    "q": "Bin-pack or sort?",
+    "a": "Bin-packing is cheap and fixes file counts; sorting costs more CPU but narrows each file's min and max ranges so symbol filters prune well. For tick tables queried by symbol I would sort; for append-only logs, bin-pack."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B1-05",
+  "topic": "object-storage",
+  "q": "Explain replication versus erasure coding. Which would you use here?",
+  "mid": "Replication keeps full copies: three copies survive two failures at 3x raw capacity, and a rebuild copies one surviving replica. Erasure coding splits data into k data chunks and m parity chunks; the overhead is (k+m)/k and it survives m failures, so 4+2 costs 1.5x and survives two.",
+  "senior": "EC needs k+m failure domains plus one to self-heal, a rebuild reads k times the lost data, and small objects turn into k+m tiny writes. So I would pair a replicated NVMe pool for indexes and small objects with EC 4+2 for Parquet on six to eight hosts; 8+3 or 10+4 only pay off with 12 to 15 failure domains. With EC a slow disk sits on many read paths, so per-disk latency outliers need alerts.",
+  "followups": [
+   {
+    "q": "Why not 8+3 to save space?",
+    "a": "With host as the failure domain, 8+3 needs 11 hosts and ideally 12. the cluster will be smaller, and each rebuild would read eight times the lost data."
+   },
+   {
+    "q": "How does SeaweedFS do it?",
+    "a": "It replicates hot volumes and erasure-codes sealed warm volumes with RS(10,4) in 1 GB chunks, so small files never pay per-object EC cost. Overhead is 1.4x and it tolerates four lost shards."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B1-06",
+  "topic": "object-storage",
+  "q": "Object, block, file storage and HDFS: what is the difference, and where would each go on-prem?",
+  "mid": "Block storage is a raw disk device one host mounts, used under databases. File storage is a shared POSIX filesystem with rename and locks, like EFS or NFS. Object storage is immutable objects under keys over HTTP, very scalable, with no rename or append. HDFS is a distributed filesystem whose NameNode holds all metadata in memory.",
+  "senior": "On-prem: block for Postgres (positions, P&L) and MPP engine local disks, file for POSIX tools and some GPU scratch, object for the lake. HDFS ties compute to storage and its NameNode heap caps file counts (about 150 bytes per file, directory and block, a Cloudera rule of thumb), which is why new lakes use object storage plus a table format. Ceph can serve all three from one cluster, which helps a small team at the price of one complex system.",
+  "followups": [
+   {
+    "q": "Could Postgres live on object storage?",
+    "a": "Its data directory needs block or file storage with in-place writes and fsync. Object storage suits its backups and WAL archives."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B1-07",
+  "topic": "lake-setup",
+  "q": "What are the main performance considerations for object storage under a data lake?",
+  "mid": "File size and file count first, then parallel range GETs with enough connections, retries with backoff, and no LIST in query planning because Iceberg plans from metadata. Engine-local NVMe caches cut repeat reads.",
+  "senior": "On-prem limits come from gateway CPU, the metadata tier and disk IOPS; AWS's per-prefix figures of 3,500 writes and 5,500 reads per second do not apply. So I watch request rates as well as bytes. A 25 GbE port is about 3.1 GB/s, so scanning 1 TB on one node takes over five minutes, and storage must deliver the aggregate. NVMe on every metadata tier, EC matched to large files, separate compute with caches, and degraded-mode tests, because users feel the rebuild.",
+  "followups": [
+   {
+    "q": "Would you enable Iceberg's hashed object-storage paths?",
+    "a": "On AWS, for hot tables, to spread requests across prefixes. On-prem there is no per-prefix limit, so I would leave write.object-storage.enabled at its default of false and keep paths readable."
+   },
+   {
+    "q": "Which cache would you use?",
+    "a": "Each engine's own first: StarRocks Data Cache, the Doris file cache, ClickHouse's filesystem cache or Trino's file system cache. A shared Alluxio tier only if measurements show several engines re-reading the same data, and only after checking how each engine reaches it, since Trino 482 (June 2026) removed its Alluxio file system support."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B1-08",
+  "topic": "lake-setup",
+  "q": "How would you organise zones and buckets in the lake?",
+  "mid": "Landing keeps raw files exactly as received, bronze holds append-only Iceberg copies with ingestion metadata, silver holds cleaned and conformed data, gold holds business marts. A small set of buckets by zone and sensitivity, with domains such as markets, credit and funds as namespaces inside them.",
+  "senior": "Bucket boundaries follow the controls that only exist per bucket: versioning, object lock, lifecycle, replication and default encryption. So WORM records, investor personal data, scratch and logs each get their own bucket, and object lock never sits on Iceberg warehouses because maintenance must delete files. Bronze is the replay source, so its retention is an explicit decision.",
+  "followups": [
+   {
+    "q": "Why not one bucket per domain?",
+    "a": "It gives clean ownership but mixes zones with different retention and lock rules in one bucket. Namespaces and prefix policies give domain ownership without that."
+   },
+   {
+    "q": "Where do intraday ticks land?",
+    "a": "Straight into a bronze Iceberg table from the feed handler, in batches, because there is no as-received file to keep. Files such as bhavcopy and loan tapes pass through landing first."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B1-09",
+  "topic": "lake-setup",
+  "q": "How do you secure access to the lake at the storage level?",
+  "mid": "One service account per engine and pipeline role, scoped by bucket and prefix policies: ingestion writes landing and bronze, transformations read bronze and write silver and gold, the MPP engine reads gold. Credentials live in a secrets store and are fetched at runtime.",
+  "senior": "The store only knows keys, so table, column and row rules (masking PAN, restricting investor records) live in the catalog and engines. Better than standing keys is credential vending: the Iceberg REST catalog returns short-lived, table-scoped credentials or signs requests, which needs STS in the store (Ceph RGW supports AssumeRole). AI agents never receive store credentials; they query through the governed engine under their own identity.",
+  "followups": [
+   {
+    "q": "What exactly is credential vending?",
+    "a": "When loading a table the engine sends X-Iceberg-Access-Delegation with vended-credentials or remote-signing. The catalog returns temporary credentials scoped to that table's location, or signs each request, so the engine holds no broad bucket keys."
+   },
+   {
+    "q": "How do you audit it?",
+    "a": "Store access logs per service account plus catalog and engine query logs. A request under an unexpected identity is a bypass to investigate."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B1-10",
+  "topic": "lake-setup",
+  "q": "How would you meet record-retention and WORM requirements?",
+  "mid": "Object lock, which requires versioning: compliance mode for records nobody may delete before the retention date, governance mode where an authorised override is acceptable, and legal holds for disputes. The retention periods come from compliance.",
+  "senior": "I would keep locked records (as-received trade files, KYC documents, client tapes) in a dedicated bucket and leave Iceberg warehouses unlocked, because compaction and snapshot expiry must delete files. Iceberg tags keep point-in-time views such as a month-end book readable. On Ceph multisite I would check that lock settings and retention are actually in force on the DR zone before relying on them there.",
+  "followups": [
+   {
+    "q": "What does versioning cost on a warehouse bucket?",
+    "a": "Every overwrite and delete keeps the old bytes as noncurrent versions, so without a NoncurrentVersionExpiration rule storage grows with every compaction. A 7 to 14 day undo window is a reasonable default."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B1-11",
+  "topic": "object-storage",
+  "q": "What does strong read-after-write consistency mean, and do we get it on-prem?",
+  "mid": "After a successful PUT, overwrite or DELETE, every later GET and LIST from any client reflects it. AWS S3 has given this for all requests since December 2020; before that a LIST could miss files just written.",
+  "senior": "On-prem it depends on product and topology: single-site Ceph RGW is strongly consistent because RADOS is, multisite replication lags so a DR site can be stale, and Garage lets you trade it away with its degraded or dangerous modes. It is a per-key guarantee, so multi-file atomicity still needs a table format. I would test it in the POC with concurrent PUT-then-GET and LIST loops while restarting nodes.",
+  "followups": [
+   {
+    "q": "Why does per-key consistency matter for Spark output?",
+    "a": "A job writing 300 files cannot publish them at one instant, so a reader listing midway sees a partial partition. Iceberg readers only see files listed in a committed snapshot."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B1-12",
+  "topic": "lake-setup",
+  "q": "How would you do disaster recovery for the lake?",
+  "mid": "Asynchronous replication to a second site with the store's own feature (Ceph multisite, SeaweedFS filer.sync, RustFS site replication), with the catalog database backed up and restored alongside. The RPO is the replication lag.",
+  "senior": "Iceberg adds traps: a metadata.json can arrive before its data files, absolute paths embed bucket and endpoint names, and the catalog is state. So I would keep bucket names identical across sites, back up the catalog in step, and at failover register each table at the newest snapshot whose files exist. Scratch and logs are excluded, replication lag is alerted on, and drills run the gold queries.",
+  "followups": [
+   {
+    "q": "What if the DR site uses different bucket names?",
+    "a": "Every absolute path breaks and you need Iceberg's rewrite-table-path action. Relative paths are only in the not-yet-adopted v4 work as of Oct 2026."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B1-13",
+  "topic": "object-storage",
+  "q": "How is a self-hosted object store built inside, and where are the bottlenecks?",
+  "mid": "Gateways speak S3, check signatures and route requests; a metadata store with a bucket index maps keys to data; data nodes hold replicas or EC chunks. In Ceph that is RGW, a sharded bucket index in RADOS and one OSD per disk; in SeaweedFS it is an S3 gateway, a filer with a database, masters and volume servers.",
+  "senior": "Gateways scale out easily. The metadata tier is the usual bottleneck for LIST and small PUTs, so it goes on NVMe (Ceph's guide puts RGW index pools on SSD) and is planned around object counts, such as Ceph's advice of at most 100,000 entries per index shard. Disks bound large reads by bandwidth and small reads by IOPS. When latency rises while disks are idle, I look at the metadata tier first.",
+  "followups": [
+   {
+    "q": "Why is SeaweedFS good with small files?",
+    "a": "It packs them into large append-only volume files with a small in-memory index, following Facebook's Haystack design, so each read is one disk read and there is no per-file disk file."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B1-14",
+  "topic": "lake-setup",
+  "q": "Would you co-locate compute and storage on the same servers, or separate them?",
+  "mid": "Separate for production: compute and storage scale independently, and rebuilds or scrubs do not slow queries. Engine-local NVMe caches recover most of the benefit of local reads.",
+  "senior": "Co-location saves servers, but S3 clients do not schedule work near the bytes, so its main effects are interference and a bigger blast radius per host failure. I would co-locate only in a lab or a very small cluster. Separation also matches shared-data engines such as StarRocks with stateless CN nodes or Doris in decoupled mode, where compute keeps only a local cache.",
+  "followups": [
+   {
+    "q": "What network would you want between them?",
+    "a": "At least 25 GbE per compute node, more on storage nodes, and a leaf-spine fabric with headroom for rebuild traffic during market hours."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B1-15",
+  "topic": "lake-setup",
+  "q": "How would you benchmark a candidate object store before buying hardware?",
+  "mid": "fio on the raw drives first, then warp against the S3 endpoint: large-object GET throughput, small-object latency, small-PUT rate and LIST on a bucket with millions of keys. Then run the candidate engines on Iceberg tables shaped like the data.",
+  "senior": "The tests that matter are degraded ones: repeat everything with one disk pulled and one node down, time the rebuild and measure query p99 while it runs. I compare p99 as well as throughput, and request rates as well as bytes, because lakes saturate on requests. The results decide the EC layout, where NVMe goes, and whether all-flash beats HDD at this capacity.",
+  "followups": [
+   {
+    "q": "Isn't warp a MinIO tool?",
+    "a": "Yes, from MinIO and AGPLv3, but its repository is still maintained as of Oct 2026 (v1.8.2, Sep 2026) and it works against any S3 endpoint; it now also benchmarks Iceberg catalog reads and commits, with AIStor Tables and Apache Polaris named as the supported catalogs."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B1-16",
+  "topic": "object-storage",
+  "q": "Query p99 latency on the lake doubled overnight while median latency is unchanged. How do you debug it?",
+  "mid": "Check what changed: deployments, data volume, cache hit ratio. Then look at storage latency per operation and per disk, 5xx rates, and whether the cluster is degraded or rebuilding.",
+  "senior": "An unchanged median with a worse tail points to one slow component on some request paths. In an EC pool every read waits for k chunks, so one degrading disk hurts many objects: I would sort per-disk latency (ceph osd perf), check SMART, mark the outlier out, throttle backfill in market hours and replace it. Other suspects are a daytime rebuild or deep scrub, a bucket-index reshard, or one overloaded gateway behind the load balancer.",
+  "followups": [
+   {
+    "q": "Why does a slow disk hurt more than a dead one?",
+    "a": "A dead disk is excluded and reads rebuild from parity; a slow one stays in the read path, and every request touching it waits."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B1-17",
+  "topic": "lake-setup",
+  "q": "After a cleanup job ran, an Iceberg table started throwing file-not-found errors. What happened and how do you fix it?",
+  "mid": "Something deleted files the table still referenced: an age-based lifecycle rule on a warehouse prefix, or orphan-file removal with a threshold shorter than a running write. Iceberg's current snapshot can reference old files in partitions that are never rewritten.",
+  "senior": "Recovery: restore noncurrent versions if versioning was on, or copy from DR; otherwise roll back to a snapshot whose files all exist and re-ingest from landing. Prevention: only Iceberg maintenance deletes from warehouse prefixes, orphan thresholds stay longer than the longest write (Iceberg defaults to 3 days), and retention is a table operation: delete rows, then expire snapshots.",
+  "followups": [
+   {
+    "q": "Why can't a lifecycle rule know a file is live?",
+    "a": "The store sees objects and their ages; only table metadata knows which files a snapshot references. Age says nothing about liveness for old partitions."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B1-18",
+  "topic": "object-storage",
+  "q": "Requests to the object store fail with signature errors, but only from one host. What do you check?",
+  "mid": "The host's clock first: S3 rejects SigV4 requests more than 15 minutes off its clock (S3-compatible stores use a similar window), and the error shows as RequestTimeTooSkewed or a signature mismatch. Then the credentials, region string and path-style settings on that host.",
+  "senior": "Time sync is part of the storage stack: chrony on every host from configuration management, an alert on clock offset, and awareness that Ceph monitors warn at 0.05 seconds of drift. Failures that follow pod placement onto one node usually point at that node's configuration.",
+  "followups": [
+   {
+    "q": "Why would a region string matter on-prem?",
+    "a": "The region is part of what gets signed; if client and store disagree the signatures differ, which looks like a credentials problem."
+   }
+  ],
+  "level": "deep"
+ }
+]

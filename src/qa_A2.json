@@ -1,0 +1,362 @@
+[
+ {
+  "id": "A2-01",
+  "topic": "independent-scaling",
+  "q": "What does it mean to scale compute and storage independently, and why can't a shared-nothing MPP database do it?",
+  "mid": "Independent scaling means adding CPU and RAM without adding disk, or adding storage without adding CPU. In shared-nothing, each tablet lives on a node's local disk with replicas on other nodes, so more storage means more nodes, and adding a node means rebalancing: copying tablets onto it while it also serves queries. Shared-data keeps the durable copy in object storage, so compute nodes are stateless with a local cache and can be added or removed without moving data.",
+  "senior": "The rebalancing cost is concrete: 6 nodes holding 12 TB compressed at 3 replicas is 36 TB on disk, and adding 2 nodes moves about 9 TB, hours at a throttled rate. The 2016 Snowflake paper lists the coupling problems (one hardware shape for mixed workloads, reshuffles on membership change, hard online upgrades) and also notes they are tolerable on-prem with a small fixed pool. So I would weigh shared-data on isolation and failure handling more than on elasticity, and measure the cache-miss penalty first.",
+  "followups": [
+   {
+    "q": "What does a stateless compute node lose when it dies?",
+    "a": "Only its cache. Durable data is in object storage, so recovery means starting a new node and letting it warm up; nothing is re-replicated."
+   },
+   {
+    "q": "Is open-source ClickHouse shared-data if I put MergeTree on S3?",
+    "a": "Only partly. Each replica keeps its own copy unless zero-copy replication is enabled, which is off by default since 22.8 and not recommended for production; SharedMergeTree ships only in ClickHouse Cloud (as of Oct 2026)."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A2-02",
+  "topic": "mpp-performance",
+  "q": "What factors define performance in an MPP database?",
+  "mid": "Data layout first: partitioning for pruning, a high-cardinality bucket key for even spread, and a sort key so the prefix index and zone maps skip data. Then storage and I/O (columnar format, encoding, compression, predicate pushdown), execution (vectorised operators, parallelism, memory and spill, runtime filters), how joins move data (broadcast, shuffle, bucket shuffle, colocate), optimiser statistics, materialised views, concurrency controls, the write path and hardware.",
+  "senior": "The rule over all of it is that a distributed query is as fast as its slowest instance, so skew can cancel any amount of hardware. Most of the budget is spent at CREATE TABLE time, because bucket keys and counts need a table rewrite to change. I would separate single-query latency from throughput under concurrency, set p95 targets per workload class, and validate with representative queries, cold and warm, at real concurrency; vendor benchmarks are hints at best.",
+  "followups": [
+   {
+    "q": "Which factor would you check first on a slow query?",
+    "a": "The plan: partitions pruned and join strategies in EXPLAIN, then the profile for the slowest operator and the max versus min spread across its instances."
+   },
+   {
+    "q": "Why is skew so damaging?",
+    "a": "The query waits for its slowest instance. With 8 buckets, a bucket holding 40% of rows instead of 12.5% makes the query about 3.2 times slower, and adding nodes leaves that hot bucket unchanged."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A2-03",
+  "topic": "independent-scaling",
+  "q": "In a shared-data deployment, what are the new bottlenecks and how would you mitigate them?",
+  "mid": "The local cache becomes critical, because a miss goes to object storage, which for AWS S3 is roughly 100 to 1,000 times slower on first byte than local NVMe, and less for a self-hosted store on a LAN (rule of thumb). Network bandwidth caps cold reads, object-store request rates limit small-file workloads, the metadata service sits on every plan and commit, and compaction competes with queries on the same compute nodes. Mitigations: size the cache for the hot set, warm it up, batch loads and keep compaction healthy.",
+  "senior": "I would watch remote-read share per workload class, cache hit rate per node, object-store p99 GET latency and errors, and compaction score. Tools: StarRocks CACHE SELECT (v3.3+) scheduled before market open, Doris WARM UP COMPUTE GROUP, Doris TTL cache for small hot tables, and a long enough datacache.partition_duration. A 25 GbE port is 3.125 GB/s line rate, and the object store's aggregate bandwidth must cover several nodes reading cold at once. In Doris decoupled mode, FoundationDB becomes a tier-one dependency.",
+  "followups": [
+   {
+    "q": "What hit rates are realistic?",
+    "a": "Snowflake reported 60% to 80% average hit rates with small local storage, depending on query type (NSDI 2020). For dashboards on a well-sized cache I would expect higher and would alert on sudden drops."
+   },
+   {
+    "q": "Why do small files hurt more in shared-data?",
+    "a": "Each file costs at least one GET, each load adds versions that compaction must merge, and freshly compacted files start cold in caches."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A2-04",
+  "topic": "mpp-performance",
+  "q": "How would you choose the bucket or distribution key for a tick or trades table?",
+  "mid": "Pick a stable, high-cardinality column, ideally the one you join or aggregate on, such as the contract or instrument ID. Avoid low-cardinality or popular-value columns like trade date or underlying, which create hot tablets. Partition by trade date for pruning and sort by instrument and timestamp for the main access path.",
+  "senior": "StarRocks rules of thumb: key cardinality about 1,000 times the node count, 1 to 10 GB per bucket, re-shard before 5 to 10 GiB. I would check skew on the heaviest day (F&O expiry) by counting rows per candidate key and looking at the top share. Bucketing by underlying could put NIFTY's 40% (illustrative) into one of 8 buckets, 3.2 times the balanced share. Hashing by trade_id balances perfectly but gives no bucket pruning and no colocate joins.",
+  "followups": [
+   {
+    "q": "How many buckets per daily partition?",
+    "a": "From data size: at about 6 GB compressed a day, the 1 to 10 GB guidance suggests at most about 6 (1 GB each); I might choose 8 for one tablet per node and state that trade-off."
+   },
+   {
+    "q": "When would you use random bucketing?",
+    "a": "For log-like tables with no stable join key, where skew-proof writes matter more than pruning and colocate joins."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A2-05",
+  "topic": "mpp-performance",
+  "q": "Walk me through diagnosing a slow query in StarRocks or Doris.",
+  "mid": "First classify it: always slow, or only at certain times. Then EXPLAIN to check partition pruning, tablets touched, join strategies and estimated rows. Then the query profile: find the most expensive operator, compare rows read with rows returned, and compare max against min across instances for skew. Then check join build sizes, memory and spill, and whether estimates match actuals.",
+  "senior": "Sometimes-slow is usually concurrency, cold cache or compaction, so I check queues, remote bytes and compaction score before touching the plan. StarRocks' own guide treats peak memory above 80% per node or spill above 1 GB as red flags. I would capture profiles only for slow queries with big_query_profile_threshold, keep a before profile, and fix the cheapest layer first: query rewrite, statistics, hint, materialised view, then layout, and hardware last.",
+  "followups": [
+   {
+    "q": "What does a scan with rows read far above rows returned tell you?",
+    "a": "Pruning or pushdown failed: a function on the partition column, a filter that cannot be pushed down such as a leading-wildcard LIKE, or a sort key that does not match the filter."
+   },
+   {
+    "q": "How do you spot skew in a profile?",
+    "a": "A wide gap between max and min OperatorTotalTime or input rows across instances of the same operator."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A2-06",
+  "topic": "mpp-performance",
+  "q": "Explain broadcast, shuffle, bucket shuffle and colocate joins. When would you use each?",
+  "mid": "Broadcast copies the small side to every node, which is cheap when the right side is small after filtering. Shuffle re-hashes both sides on the join key, the general case for two large tables. Bucket shuffle sends only the right side to match the left table's buckets when the join key includes the left bucket key. Colocate moves nothing, because both tables share bucket key types, bucket count and replica count in one colocation group.",
+  "senior": "Doris documents network cost as N times T(R) for broadcast, T(S) plus T(R) for shuffle, T(R) for bucket shuffle and zero for colocate. Broadcast also needs the whole right side in memory on each node, so engines cap it: StarRocks broadcast_row_limit 15 million rows, Trino 100 MB, Spark 10 MB. Colocation is fragile in shared-nothing: an Unstable group after a node event silently degrades the join. I would colocate only big pairs and keep small dimensions broadcast.",
+  "followups": [
+   {
+    "q": "What is an accidental broadcast and how do you catch it?",
+    "a": "A table assumed small that grew, or stale statistics calling it small. EXPLAIN shows BROADCAST and the exchange's BytesSent is huge; refresh statistics or force SHUFFLE."
+   },
+   {
+    "q": "How does ClickHouse handle this?",
+    "a": "A JOIN on a Distributed table runs the right side locally on each shard, which is correct only if keys are co-sharded; GLOBAL JOIN builds the right side on the initiator and ships it to every shard, which is a broadcast."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A2-07",
+  "topic": "independent-scaling",
+  "q": "How would you isolate month-end NAV and risk batch from intraday dashboards?",
+  "mid": "Use hard isolation where possible: a separate Doris compute group or StarRocks warehouse reading the same data, so batch CPU and memory never compete with dashboards. Inside one pool, use resource groups with CPU weights, memory limits and concurrency caps, plus query queues. Schedule and warm the batch compute before it starts.",
+  "senior": "Check the edition: Doris compute groups are open source, while StarRocks warehouses are documented as an Enterprise Edition feature in the operator release notes, with open-sourcing announced in September 2025, so I would verify in the POC (as of Oct 2026). Without them, the options are resource groups with exclusive cores, or a second engine or cluster on the same Iceberg tables. Watch shared-cache side effects such as Doris peer cache reads, which the docs say weaken isolation.",
+  "followups": [
+   {
+    "q": "Hard versus soft isolation?",
+    "a": "Hard means separate machines; soft means quotas within shared machines, which still share caches, disks and network."
+   },
+   {
+    "q": "How do you route a session to a Doris compute group?",
+    "a": "USE db@group, after granting USAGE_PRIV on the compute group; users can also have a default compute group."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A2-08",
+  "topic": "independent-scaling",
+  "q": "We will run on our own racks with a fixed hardware pool. Does decoupling compute and storage still buy us anything?",
+  "mid": "Less elasticity than in the cloud, since there are no spare nodes to rent at month-end. It still gives workload isolation over shared data, failure recovery without re-replication, storage growth on cheaper object-store nodes without buying query CPUs, and easier rolling upgrades. Capacity can also shift between jobs if compute runs on Kubernetes next to Prefect workers.",
+  "senior": "The Snowflake authors note that shared-nothing's problems are tolerable on-prem with a small fixed pool, and their NSDI 2020 data shows only about 20% of clusters used elasticity even in the cloud. At under 40 TB, a hybrid is reasonable: hot risk and position tables in native tables on NVMe, history in Iceberg on object storage, one engine over both. The cost is operating an object store, possibly FoundationDB, and a cache tier, so I would decide on measured p95 per workload class from a POC.",
+  "followups": [
+   {
+    "q": "What would make you choose shared-nothing?",
+    "a": "Cache misses hurting dashboard p95 in the POC, a small team, and data that fits comfortably on a few nodes' NVMe with replicas."
+   },
+   {
+    "q": "What does shared-data cost operationally?",
+    "a": "One or two more critical systems (object store, Doris FoundationDB), cache tuning, compaction monitoring and more network design."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "A2-09",
+  "topic": "mpp-performance",
+  "q": "How does ClickHouse's distributed execution differ from StarRocks or Doris, and what does that mean for join-heavy workloads?",
+  "mid": "ClickHouse's Distributed table sends the query to every shard, does partial work there including partial aggregation, and merges intermediate states on the initiator. Joins on Distributed tables run the right side locally on each shard unless you use GLOBAL, which broadcasts it. StarRocks and Doris plan general shuffles, bucket-shuffle and colocate joins between any fragments.",
+  "senior": "My view: ClickHouse is excellent for scan-and-aggregate over one big table such as ticks, and needs more modelling (co-sharding, denormalisation, dictionaries) when two large tables join, like positions with trades or loan cash flows with deals. StarRocks and Doris are more forgiving for star-schema joins. Open-source ClickHouse lacks SharedMergeTree, so it is effectively shared-nothing with S3 as a cheaper disk (as of Oct 2026). I would let the join-heavy queries decide in the POC.",
+  "followups": [
+   {
+    "q": "When is a non-GLOBAL join on a Distributed table correct?",
+    "a": "When matching keys are guaranteed to be on the same shard, which means both tables are sharded by the join key."
+   },
+   {
+    "q": "Which ClickHouse limit catches tick ingestion?",
+    "a": "Too many parts: by default inserts slow down at 1000 active parts in a partition and fail at 3000, so batch inserts or use asynchronous inserts."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A2-10",
+  "topic": "independent-scaling",
+  "q": "How do you measure whether the cache is working?",
+  "mid": "Per query, read the profile: StarRocks shows CompressedBytesReadRemote, IOCountRemote and IOTimeRemote, and non-zero values mean misses; Doris shows BytesScannedFromCache against BytesScannedFromRemote. Per node, read cache hit rates and eviction counters. Then correlate with query latency.",
+  "senior": "My single metric is remote-read share per workload class: remote bytes over total bytes for dashboards, research and batch separately. A cluster-wide hit rate can look healthy while one class misses. I would alert on sudden drops (eviction by a big scan, or a scale-out) separately from a slow decline (hot set outgrowing the cache), and track object-store p99 GET latency and errors alongside.",
+  "followups": [
+   {
+    "q": "Where is the hit rate in StarRocks?",
+    "a": "The BE endpoint /api/datacache/app_stat reports block cache and page cache hit rates."
+   },
+   {
+    "q": "And in Snowflake?",
+    "a": "The query profile shows percentage scanned from cache and splits time into processing, local disk I/O, remote disk I/O and network communication."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A2-11",
+  "topic": "independent-scaling",
+  "q": "You add nodes for month-end and queries get slower. Why?",
+  "mid": "New nodes start with empty caches. Adding nodes remaps tablet ownership, so a share of tablets is now served by cold nodes reading from object storage, and since a query waits for its slowest instance, every query slows. The StarRocks shared-data FAQ lists tablet migration from elastic scaling as a cause of cache misses.",
+  "senior": "Going from 4 to 8 nodes remaps roughly half the tablets. The fixes: scale out hours earlier and warm up (CACHE SELECT, Doris WARM UP, or a warm-up rebalance mode such as async_warmup), or better, add a separate compute group for the batch so the dashboard group's cache is never remapped. Redshift reports more than 80% local hit rate at only 20% hotness-ordered rehydration, so warming the hot partitions first is usually enough.",
+  "followups": [
+   {
+    "q": "How would you confirm it?",
+    "a": "Profiles show remote bytes and remote I/O time jumping on instances running on the new nodes, and node-level hit rates show the new nodes near zero."
+   },
+   {
+    "q": "How long does warm-up take?",
+    "a": "Arithmetic: re-reading 1 TB at an aggregate 5 GB/s from the object store is about 200 seconds of full-speed reading; lazy warm-up through queries takes as long as the workload takes to touch the hot set."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "A2-12",
+  "topic": "mpp-performance",
+  "q": "What is data skew, how do you detect it and how do you fix it?",
+  "mid": "Skew is uneven distribution: one bucket or one shuffle partition has far more rows, so one instance does most of the work. Detect it in the profile as a large max versus min gap in operator time or input rows, or with SHOW TABLET showing one tablet much bigger than the rest. Fix it with a higher-cardinality bucket key, or salting for join and aggregation shuffles.",
+  "senior": "There are two kinds: storage skew from the bucket key, and runtime skew from shuffles on a hot join or group key. Storage skew needs a table rewrite; runtime skew can use salting (key plus mod(id, 16)) or StarRocks skew hints. More nodes leave the hot tablet as hot as before. Check candidate keys against the heaviest day, which for F&O is expiry.",
+  "followups": [
+   {
+    "q": "Can random bucketing fix storage skew?",
+    "a": "Yes, it is uniform by design, but you give up bucket pruning, colocate joins and bucket-shuffle joins."
+   },
+   {
+    "q": "Why is the effect so large?",
+    "a": "Query time follows the slowest instance; a bucket with 3.2 times its fair share makes the query about 3.2 times slower."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A2-13",
+  "topic": "mpp-performance",
+  "q": "Tick ingestion starts failing with 'too many versions'. What is happening and how do you fix it?",
+  "mid": "Each load adds a version, a new set of files, to every tablet it touches, and queries must merge versions that compaction has not merged yet. Loading too often in tiny batches creates versions faster than compaction merges them, until the per-tablet limit rejects writes. The fix is fewer, larger loads, for example buffering a few seconds and sending one Stream Load per table.",
+  "senior": "Limits: StarRocks tablet_max_versions defaults to 1000; Doris max_tablet_version_num is 500 per the 4.x docs, with error -235; ClickHouse slows inserts at 1000 parts and rejects at 3000. In StarRocks shared-data, loads are throttled at compaction score 100 and rejected at 2,000 by default (since v3.3.6). I would alert on compaction score well below the limit, reduce bucket count on high-frequency intraday tables, and give compaction enough threads (StarRocks suggests about 25% of cores).",
+  "followups": [
+   {
+    "q": "Why not just raise the version limit?",
+    "a": "It hides the cause: more versions mean slower reads and a bigger compaction backlog. The load pattern is what needs to change."
+   },
+   {
+    "q": "What is the ClickHouse fix?",
+    "a": "Batch inserts, or use asynchronous inserts so the server buffers rows into fewer parts."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A2-14",
+  "topic": "mpp-performance",
+  "q": "A GROUP BY query fails with a memory limit error. What do you do?",
+  "mid": "Check the profile for the aggregation's hash table memory and the number of groups. If the GROUP BY has hundreds of millions of distinct keys, partial aggregation cannot reduce rows and the final hash table outgrows the limit. Options: narrow or reshape the question, precompute with a materialised view, enable spill, or raise the limit.",
+  "senior": "Order matters: question shape first, then spill as a safety net (enable_spill is off by default in StarRocks and Doris; with spill_mode auto and no resource groups, StarRocks spills at 80% of query_mem_limit), then limits. Raising a resource group's memory lets one query take memory from everyone. For research I would enable spill in those sessions and set big_query_mem_limit in the research resource group, and keep dashboards in a group without spill so bad queries fail fast.",
+  "followups": [
+   {
+    "q": "What does StarRocks query_mem_limit default to?",
+    "a": "0, meaning no per-query limit, so the resource group and process limits apply."
+   },
+   {
+    "q": "How does this relate to Kubernetes OOM kills?",
+    "a": "Same symptom one layer down: a container limit kills the whole process (exit code 137), while a database memory limit fails one query, which is why those limits exist."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A2-15",
+  "topic": "mpp-performance",
+  "q": "How do partitioning, sort keys and indexes reduce the data a query reads?",
+  "mid": "Partition pruning skips whole partitions, usually by date. Bucket pruning skips buckets when the filter is on the bucket key. Inside tablets, the sort key lets the prefix index jump to row ranges, and zone maps skip pages whose min and max cannot match. Bloom filter indexes help equality filters on high-cardinality non-sort columns; bitmap indexes help low-cardinality columns.",
+  "senior": "StarRocks' prefix index has one entry per 1,024 rows and at most 36 bytes, so fixed-width columns go first; ClickHouse's sparse index marks every 8,192 rows by default. Zone maps only help clustered columns. A sort key serves one main access pattern: ticks sorted by instrument and timestamp are great for one contract over time and weak for all contracts in a five-second window, which I would serve with an MV or projection.",
+  "followups": [
+   {
+    "q": "Why would pruning fail?",
+    "a": "Functions or casts on the partition column, or filters the planner cannot map to partition ranges."
+   },
+   {
+    "q": "What is the Snowflake equivalent?",
+    "a": "Micro-partition pruning, visible as partitions scanned against partitions total in the query profile."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A2-16",
+  "topic": "mpp-performance",
+  "q": "How do stale statistics hurt, and what is your statistics policy?",
+  "mid": "The cost-based optimiser estimates rows per operator from statistics to choose join order, build side and broadcast versus shuffle. After a big load, stale statistics can make a large table look small, so it gets broadcast or used as the build side. I would refresh statistics after every bulk load.",
+  "senior": "StarRocks auto-collects when statistics health falls below statistic_auto_collect_ratio (default 0.8), but collection runs on an interval, so a backfill can be queried before statistics catch up. I would put ANALYZE TABLE at the end of each Prefect bulk-load flow, add histograms on skewed columns, and monitor estimated versus actual rows on key reports. Trino without statistics only eliminates cross joins, so join order is largely as written.",
+  "followups": [
+   {
+    "q": "How do you see that statistics are wrong?",
+    "a": "In the profile or EXPLAIN ANALYZE, estimated rows differ from actual rows by orders of magnitude at a scan or join."
+   },
+   {
+    "q": "Can hints replace statistics?",
+    "a": "Only as a stopgap. Hints also disable join reordering for that query, so they need maintenance as data changes."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "A2-17",
+  "topic": "independent-scaling",
+  "q": "Where does compaction run in a shared-data cluster, and why does it matter?",
+  "mid": "In StarRocks shared-data the FE schedules compaction and the CN compute nodes execute it, so it shares CPU, memory and network with queries. If it falls behind, segment counts and compaction scores rise and queries slow down.",
+  "senior": "StarRocks' adaptive default allows live CNs times 16 concurrent compaction tasks, and its docs suggest compact_threads at about 25% of cores in production. Compaction writes new files that start cold in caches; Doris writes cumulative-compaction output into the file cache by default. With multi-warehouse (treated as Enterprise Edition in StarRocks until verified) compaction could in principle get its own compute pool; in open source I would run heavy manual compaction overnight and watch MAX_CS in information_schema.partitions_meta.",
+  "followups": [
+   {
+    "q": "What compaction score is healthy?",
+    "a": "The StarRocks shared-data FAQ says below about 10; by default loads are throttled at 100 and rejected at 2,000."
+   },
+   {
+    "q": "What happens after a large backfill?",
+    "a": "Thousands of small files per partition, a compaction backlog, high GET rates and slow queries until compaction catches up."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "A2-18",
+  "topic": "mpp-performance",
+  "q": "How would you handle high concurrency: dozens of dashboards plus AI agents?",
+  "mid": "Use admission control: resource groups per workload class with CPU and memory shares and concurrency limits, and query queues so excess queries wait. Precompute what dashboards query repeatedly with materialised views. Give AI agents their own group with strict limits and timeouts.",
+  "senior": "Capacity arithmetic: 256 cores and 2 CPU-seconds per dashboard query gives about 128 queries per second at full CPU, about 77 at 60% utilisation. StarRocks query queues are off by default; resource groups support concurrency_limit and big-query limits on scanned rows, CPU seconds and memory. Agents generate unreviewed SQL, so I would steer them to curated views and MVs and cap their scans hard, so their mistakes fail fast inside their own group.",
+  "followups": [
+   {
+    "q": "Why not just raise DOP for speed?",
+    "a": "Higher DOP helps one query and hurts many concurrent ones, so DOP is tuned together with concurrency."
+   },
+   {
+    "q": "Where would you get CPU-seconds per query?",
+    "a": "From profiles or the audit log, grouped by resource group or user."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "A2-19",
+  "topic": "independent-scaling",
+  "q": "How would you size the cache and compute nodes for a lake under 40 TB?",
+  "mid": "Size compute from query CPU needs and the cache from the hot set; total data size only sizes the object store. Estimate the hot set (recent positions, recent ticks for active symbols, reference data), give the cache comfortable headroom across nodes, and size the network for cold reads.",
+  "senior": "Illustrative: a 2 TB compressed hot set on 4 CNs with 3 TB of NVMe cache each gives 12 TB of cache, six times headroom for month-end and research. A 25 GbE port is 3.125 GB/s line rate, so cold-reading 500 GB per node takes minutes. I would validate in a POC by measuring hit rate, remote-read share and p95 cold and warm, and keep node specs identical within a group because the slowest node sets the pace.",
+  "followups": [
+   {
+    "q": "How do you estimate the hot set?",
+    "a": "From query logs: which partitions and columns are read in a typical week, weighted by frequency; a week of real cache metrics then confirms it."
+   },
+   {
+    "q": "What about object-store bandwidth?",
+    "a": "Its aggregate (nodes times NIC and disk throughput) must cover several compute nodes reading cold at once, for example after a restart."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "A2-20",
+  "topic": "mpp-performance",
+  "q": "When would you use materialised views, and what do they cost?",
+  "mid": "For heavy, repeated queries with stable shapes: daily volume and VWAP per instrument, exposure per book, NAV components per fund. Async MVs refresh on a schedule or on change and can join tables; with query rewrite, the optimiser uses them even when users query the base tables.",
+  "senior": "The cost is refresh compute, storage and staleness, so each MV needs an owner and a freshness SLA, and refreshes should run in a batch resource group. For agents and dashboards, MVs double as a guardrail because they read small tables. I would avoid MVs for research shapes that change weekly, and check each cache's invalidation rule before using it for anything reported externally.",
+  "followups": [
+   {
+    "q": "Sync versus async MV in StarRocks or Doris?",
+    "a": "Sync (rollup) is maintained on load for a single table; async is refreshed separately and can join multiple tables."
+   },
+   {
+    "q": "What is the ClickHouse equivalent?",
+    "a": "Incremental materialised views that act as insert triggers into a target table, and projections inside a table."
+   }
+  ],
+  "level": "deep"
+ }
+]

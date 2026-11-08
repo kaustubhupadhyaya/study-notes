@@ -1,0 +1,830 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Iceberg and Catalogs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,650&display=swap">
+<style>
+/* Layout: one reading column (~68ch) with a sticky contents rail on wide screens; field-guide boxes are
+   tinted panels led by a small label chip; numbers set in mono like an ops runbook. */
+:root {
+  --paper: #f3f5f7;
+  --surface: #ffffff;
+  --ink: #16202a;
+  --muted: #576474;
+  --line: #d6dde5;
+  --accent: #0d6a87;
+  --accent-soft: #e2eff4;
+  --code-bg: #edf1f5;
+  --say-bg: #e2eff4;   --say-fg: #0b546b;
+  --field-bg: #edf3e8; --field-fg: #3b6526;
+  --inc-bg: #fbebe9;   --inc-fg: #9a2b20;
+  --sen-bg: #eeecf8;   --sen-fg: #4a3e8e;
+  --trap-bg: #fbf2df;  --trap-fg: #855607;
+  --bri-bg: #e6f3ef;   --bri-fg: #1d6653;
+  --asof-bg: #edf0f3;  --asof-fg: #475262;
+  --font-display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --font-body: "Source Serif 4", Georgia, "Times New Roman", serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --step--1: 0.875rem; --step-0: 1.0625rem; --step-1: 1.25rem; --step-2: 1.55rem; --step-3: 2.1rem; --step-4: 2.7rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0e141a; --surface: #141c24; --ink: #e2e8ee; --muted: #9aa6b4; --line: #26313d;
+    --accent: #5bb8d6; --accent-soft: #15303b; --code-bg: #18222c;
+    --say-bg: #132c36;   --say-fg: #8fd0e6;
+    --field-bg: #18261a; --field-fg: #a6d58c;
+    --inc-bg: #2e1715;   --inc-fg: #f2a196;
+    --sen-bg: #1f1c33;   --sen-fg: #bdb3f2;
+    --trap-bg: #2c2312;  --trap-fg: #f0c26e;
+    --bri-bg: #13281f;   --bri-fg: #8fd9bf;
+    --asof-bg: #1a222b;  --asof-fg: #aab5c2;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0e141a; --surface: #141c24; --ink: #e2e8ee; --muted: #9aa6b4; --line: #26313d;
+  --accent: #5bb8d6; --accent-soft: #15303b; --code-bg: #18222c;
+  --say-bg: #132c36;   --say-fg: #8fd0e6;
+  --field-bg: #18261a; --field-fg: #a6d58c;
+  --inc-bg: #2e1715;   --inc-fg: #f2a196;
+  --sen-bg: #1f1c33;   --sen-fg: #bdb3f2;
+  --trap-bg: #2c2312;  --trap-fg: #f0c26e;
+  --bri-bg: #13281f;   --bri-fg: #8fd9bf;
+  --asof-bg: #1a222b;  --asof-fg: #aab5c2;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body { background: var(--paper); color: var(--ink); font-family: var(--font-body); font-size: var(--step-0);
+  line-height: 1.62; margin: 0; }
+.wrap { max-width: 76rem; margin: 0 auto; padding-inline: clamp(16px, 4vw, 40px); padding-block: 0 4rem; }
+a { color: var(--accent); text-underline-offset: 2px; }
+a:focus-visible, button:focus-visible, summary:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Set navigation */
+.setnav { display: flex; flex-wrap: wrap; gap: .35rem .5rem; align-items: center; padding-block: 1rem .75rem;
+  border-bottom: 1px solid var(--line); font-family: var(--font-display); font-size: var(--step--1); }
+.setnav .lbl { color: var(--muted); text-transform: uppercase; letter-spacing: .08em; font-size: .72rem; margin-right: .25rem; }
+.setnav a, .setnav span.cur { text-decoration: none; padding: .2rem .55rem; border-radius: 999px; border: 1px solid var(--line);
+  color: var(--ink); white-space: nowrap; }
+.setnav span.cur { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+.setnav a:hover { border-color: var(--accent); color: var(--accent); }
+.setnav .kind { color: var(--muted); font-size: .72rem; margin-left: .5rem; }
+
+/* Masthead */
+.mast { padding-block: 2.2rem 1.6rem; display: grid; gap: .6rem; max-width: 52rem; }
+.eyebrow { font-family: var(--font-mono); font-size: .78rem; letter-spacing: .06em; color: var(--accent); text-transform: uppercase; margin: 0; }
+h1 { font-family: var(--font-display); font-size: clamp(2rem, 5vw, var(--step-4)); line-height: 1.05; letter-spacing: -.02em;
+  margin: 0; font-weight: 700; text-wrap: balance; }
+.dek { font-size: var(--step-1); color: var(--muted); margin: 0; max-width: 46rem; }
+.meta { font-family: var(--font-mono); font-size: .78rem; color: var(--muted); margin: 0; display: flex; flex-wrap: wrap; gap: .3rem 1rem; }
+
+/* Layout */
+.layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 2.5rem; }
+@media (min-width: 64rem) { .layout { grid-template-columns: 15rem minmax(0, 1fr); } }
+.toc { font-family: var(--font-display); font-size: .88rem; }
+.toc details { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); padding: .6rem .8rem; }
+.toc summary { cursor: pointer; font-weight: 600; }
+.toc ol { list-style: none; padding: 0; margin: .5rem 0 0; display: grid; gap: .15rem; }
+.toc li.h3 { padding-left: .9rem; font-size: .82rem; }
+.toc a { color: var(--muted); text-decoration: none; display: block; padding: .15rem .3rem; border-radius: 4px; }
+.toc a:hover, .toc a.on { color: var(--ink); background: var(--accent-soft); }
+@media (min-width: 64rem) {
+  .toc { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 1rem); align-self: start; max-height: calc(100vh - 2rem); overflow-y: auto; }
+  .toc details { border: 0; background: none; padding: 0; }
+}
+main { min-width: 0; }
+
+/* Content */
+section.topic { border-top: 2px solid var(--ink); padding-top: 1.2rem; margin-bottom: 3.5rem; }
+section.topic > h2 { font-family: var(--font-display); font-size: clamp(1.6rem, 3.6vw, var(--step-3)); line-height: 1.12;
+  letter-spacing: -.015em; margin: 0 0 .8rem; text-wrap: balance; }
+h3 { font-family: var(--font-display); font-size: var(--step-2); line-height: 1.2; margin: 2.4rem 0 .6rem; text-wrap: balance; }
+h4 { font-family: var(--font-display); font-size: var(--step-1); margin: 1.6rem 0 .4rem; }
+main p, main li { max-width: 68ch; }
+p.lede { font-size: var(--step-1); line-height: 1.5; color: var(--ink); max-width: 60ch; }
+dfn { font-style: normal; font-weight: 650; background: linear-gradient(transparent 62%, var(--accent-soft) 62%); }
+code { font-family: var(--font-mono); font-size: .86em; background: var(--code-bg); padding: .08em .3em; border-radius: 4px; }
+pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1rem; overflow-x: auto;
+  font-size: .85rem; line-height: 1.5; max-width: 100%; }
+pre code { background: none; padding: 0; font-size: inherit; }
+pre.mermaid { background: var(--surface); text-align: center; }
+.tw { overflow-x: auto; margin: 1.1rem 0; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: .92rem; line-height: 1.45; }
+th, td { text-align: left; vertical-align: top; padding: .55rem .7rem; border-bottom: 1px solid var(--line); }
+th { font-family: var(--font-display); font-size: .82rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); background: var(--paper); }
+tr:last-child td { border-bottom: 0; }
+td { font-variant-numeric: tabular-nums; }
+
+/* Boxes */
+aside.box { margin: 1.3rem 0; padding: .9rem 1.1rem 1rem; border-radius: 6px; max-width: 72ch; }
+aside.box > b.lbl { display: inline-block; font-family: var(--font-mono); font-size: .72rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .08em; padding: .12rem .5rem; border-radius: 3px; margin-bottom: .45rem; }
+aside.box p:last-child, aside.box ul:last-child { margin-bottom: 0; }
+aside.box ul { padding-left: 1.2rem; }
+aside.box p, aside.box li { max-width: none; }
+.say { background: var(--say-bg); } .say > .lbl { background: var(--say-fg); color: var(--say-bg); }
+.say p { font-size: 1.02rem; }
+.field { background: var(--field-bg); } .field > .lbl { background: var(--field-fg); color: var(--field-bg); }
+.incident { background: var(--inc-bg); } .incident > .lbl { background: var(--inc-fg); color: var(--inc-bg); }
+.incident b:not(.lbl) { color: var(--inc-fg); }
+.senior { background: var(--sen-bg); } .senior > .lbl { background: var(--sen-fg); color: var(--sen-bg); }
+.trap { background: var(--trap-bg); } .trap > .lbl { background: var(--trap-fg); color: var(--trap-bg); }
+.bridge { background: var(--bri-bg); } .bridge > .lbl { background: var(--bri-fg); color: var(--bri-bg); }
+.asof { background: var(--asof-bg); } .asof > .lbl { background: var(--asof-fg); color: var(--asof-bg); }
+.cite { font-family: var(--font-mono); font-size: .8em; color: var(--bri-fg); white-space: nowrap; }
+
+dl.nums { display: grid; grid-template-columns: minmax(6.5rem, max-content) minmax(0, 1fr); gap: .45rem 1rem; margin: 1.2rem 0;
+  padding: .9rem 1rem; border: 1px dashed var(--line); border-radius: 8px; background: var(--surface); max-width: 72ch; }
+dl.nums dt { font-family: var(--font-mono); font-weight: 600; color: var(--accent); font-variant-numeric: tabular-nums; }
+dl.nums dd { margin: 0; }
+p.src { font-family: var(--font-display); font-size: .8rem; color: var(--muted); }
+p.src a { color: var(--muted); }
+
+footer.foot { margin-top: 3rem; border-top: 1px solid var(--line); padding-top: 1rem; color: var(--muted); font-size: .88rem; }
+
+@media (max-width: 30rem) { dl.nums { grid-template-columns: minmax(0, 1fr); } dl.nums dd { margin-bottom: .4rem; } }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+html { scroll-behavior: smooth; }
+
+.setnav span.soon { padding: .2rem .55rem; border-radius: 999px; border: 1px dashed var(--line); color: var(--muted); white-space: nowrap; }
+.layout.single { grid-template-columns: minmax(0, 1fr); }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav class="setnav" aria-label="Study set"><span class="lbl">Theory</span><span class="soon">Distributed DBs</span><span class="soon">MPP performance</span><span class="soon">Object storage</span><span class="soon">Compression &amp; encryption</span><span class="cur" aria-current="page">Iceberg &amp; catalogs</span><span class="soon">Design &amp; operate</span><span class="soon">Questions</span><span class="lbl" style="margin-left:.6rem">Hands-on</span><span class="soon">Lab (optional)</span></nav>
+<header class="mast">
+<p class="eyebrow">Study notes · theory</p>
+<h1>Iceberg and Catalogs</h1>
+<p class="dek">Apache Iceberg&#x27;s metadata tree, commits and maintenance, and the catalogs that make tables shareable across engines.</p>
+<p class="meta"><span>about 60 min read</span><span>11 incident drills</span><span>Theory</span></p>
+</header>
+<div class="layout">
+<aside class="toc"><details><summary>On this page</summary><ol id="toc-list"></ol></details></aside>
+<main>
+<section class="topic" id="iceberg-tables"><h2>Iceberg tables from the inside</h2>
+<p class="lede">Apache Iceberg is a table format: a set of rules for describing one table as immutable data files plus a tree of metadata files on object storage, so that many engines can read and write the same table safely. It is the layer that lets StarRocks or Doris, Trino, Spark and plain Python all work on the same tick, position and net asset value (NAV) tables on the on-prem store without copying them. This section builds the format from the problem it solves down to how it handles a single corrected trade.</p>
+
+<h3>The problem: a table that is just a directory</h3>
+<p>Before table formats, a lake table was a <dfn>Hive-style table</dfn>: a directory of files on HDFS or S3 plus an entry in the <dfn>Hive Metastore</dfn> (HMS), a database-backed service from the Hadoop world that records each table's schema, its root directory and its list of partitions. A <dfn>partition</dfn> is a group of rows stored together so a query can skip the rest. In Hive each partition is a subdirectory named after its value, such as <code>positions/trade_date=2026-10-13/</code>, and the table's contents are whatever files a reader finds when it lists those directories.</p>
+<p>That design worked on HDFS, where listing and renaming a directory are cheap, single-server operations. On object storage it has five problems that every later design choice answers.</p>
+<ol>
+<li><b>Listing is slow.</b> To plan a query the engine lists every matching partition directory. Iceberg's own reliability notes describe this as O(n) listing calls in the number of partitions. An S3 LIST returns at most 1,000 keys per page, so a year of futures and options (F&amp;O) ticks split by date and underlying means thousands of LIST round trips before any data is read.</li>
+<li><b>No atomic multi-file commit.</b> A job that rewrites a partition deletes old files and writes new ones as separate object operations. A reader in the middle sees a mix of old and new files, or an empty partition. There is no rename on object storage to make the switch in one step.</li>
+<li><b>Partition values live in paths.</b> The partition value is a directory name, so users must filter on <code>trade_date</code> explicitly. A query that filters only on the tick timestamp <code>ts</code> scans the whole table. Changing the scheme from daily to hourly breaks every saved query.</li>
+<li><b>Schema changes are unsafe.</b> Hive matches file columns to table columns by name or by position, depending on format and settings. Rename a column, or drop one and add another, and old files can return the wrong column's values or silent nulls.</li>
+<li><b>Concurrent writers have no protocol.</b> Files and the metastore are updated separately. Two jobs writing the same partition race, and the last one to touch the metastore wins.</li>
+</ol>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> On a Tuesday morning the risk dashboard shows desk P&amp;L for 13 October about 40% lower than the official report; an hour later it matches. <b>Diagnosis.</b> The nightly job overwrites <code>positions/trade_date=2026-10-13/</code> on a Hive-style table by deleting the old Parquet files and then writing new ones. The dashboard query ran between the two steps and summed only the files that existed at that moment. Nothing failed, so no alert fired. <b>Fix.</b> As a stopgap, write each night's output to a new prefix and repoint the partition's location in the metastore in one update. The real fix is a table format whose commit is a single atomic pointer swap. <b>Lesson.</b> On object storage, a directory is never a transaction boundary. If readers can run while writers write, the table needs snapshot isolation.</p></aside>
+<p class="src">Sources: <a href="https://iceberg.apache.org/docs/latest/reliability/">Iceberg reliability</a> · <a href="https://docs.aws.amazon.com/glue/latest/dg/add-crawler.html">AWS Glue crawlers</a></p>
+
+<h3>The metadata tree, from the top</h3>
+<p>Iceberg describes a table with five layers of files plus one pointer. Each layer exists so a reader can skip work at the layer below.</p>
+<ul>
+<li>The <dfn>catalog</dfn> is a service that maps a table name such as <code>markets.fo_ticks</code> to the location of the table's current metadata file, and that changes that pointer atomically. The catalogs section covers it in depth.</li>
+<li>The <dfn>metadata file</dfn> (<code>NNNNN-uuid.metadata.json</code>) is a JSON document that describes the whole table at one version: its <dfn>schemas</dfn> (every schema the table has ever had, each with an ID), its <dfn>partition specs</dfn> (rules for deriving partition values, also versioned), its <dfn>sort orders</dfn>, its <dfn>table properties</dfn> (settings such as target file size), the list of valid snapshots, named references (branches and tags) and a log of earlier metadata files. Every commit writes a new metadata file; the old one stays until it is cleaned up.</li>
+<li>A <dfn>snapshot</dfn> is the complete state of the table after one commit. In the metadata file each snapshot records a <code>snapshot-id</code>, its parent's ID, a <dfn>sequence number</dfn> (a counter that increases with every commit and orders files by age), a timestamp, the schema it was written with, the location of its manifest list and a <dfn>summary</dfn>: the operation (append, overwrite, delete, replace) plus counts such as added records and added bytes.</li>
+<li>The <dfn>manifest list</dfn> is one Avro file per snapshot. It has one row per manifest that makes up the snapshot, and each row carries a partition summary (the lowest and highest value of each partition field in that manifest, and whether it contains nulls), file and row counts, the manifest's sequence number and whether it tracks data files or delete files.</li>
+<li>A <dfn>manifest</dfn> is an Avro file that lists data files or delete files, one entry per file. Each entry holds the file path, format, partition values, record count, file size and per-column statistics: value counts, null counts, and lower and upper bounds. Manifests are reused across snapshots, which is why an append can commit by adding one small manifest and pointing at all the old ones.</li>
+<li><dfn>Data files</dfn> hold the rows, usually as Parquet. <dfn>Delete files</dfn> record rows that later commits removed without rewriting the data file (covered below). Optional <dfn>Puffin</dfn> files hold extra statistics such as distinct-value sketches, and in format v3 they also hold deletion vectors.</li>
+</ul>
+<div class="tw"><table><thead><tr><th>Layer</th><th>How many</th><th>Format</th><th>What a reader learns</th><th>What it lets the reader skip</th></tr></thead><tbody>
+<tr><td>Catalog entry</td><td>One per table</td><td>A row in the catalog's database</td><td>Where the current metadata file is</td><td>All directory listing</td></tr>
+<tr><td>Metadata file</td><td>One per commit</td><td>JSON</td><td>Current snapshot, schema, partition specs, properties</td><td>Every other snapshot</td></tr>
+<tr><td>Manifest list</td><td>One per snapshot</td><td>Avro</td><td>Which manifests exist and the partition range of each</td><td>Whole manifests whose partition range cannot match</td></tr>
+<tr><td>Manifest</td><td>Many, shared between snapshots</td><td>Avro</td><td>Each file's partition values and column min, max and null counts</td><td>Whole data files that cannot match</td></tr>
+<tr><td>Data file</td><td>Many</td><td>Parquet (or ORC, Avro)</td><td>Row-group and page statistics in the footer</td><td>Row groups, pages and unread columns</td></tr>
+<tr><td>Delete file or vector</td><td>Zero or more</td><td>Parquet, Avro, ORC or Puffin</td><td>Rows to ignore</td><td>Nothing; it adds read work</td></tr>
+</tbody></table></div>
+<p>On the object store, one table's location looks like this. The directory names under <code>data/</code> are for humans; Iceberg never reads partition values from paths.</p>
+<pre><code class="lang-text">s3://lake-silver/markets/fo_ticks/
+  metadata/
+    00041-6c1f...metadata.json          previous version
+    00042-91ab...metadata.json          current version, the catalog points here
+    snap-88120...-1-1d2e....avro        manifest list for snapshot 88120...
+    5f3c...-m0.avro                     manifest
+    5f3c...-m1.avro                     manifest
+  data/
+    ts_day=2026-10-13/underlying_bucket=7/00012-...parquet
+    ts_day=2026-10-13/underlying_bucket=7/00013-...parquet</code></pre>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Every commit rewrites the whole metadata file. Its size grows with the number of retained snapshots, schemas and references, so a table that commits every few seconds and never expires snapshots ends up with a metadata file that every reader and writer must download and parse.</li>
+<li>Paths inside metadata are absolute (<code>s3://lake-silver/...</code>) in formats v1 to v3. Renaming a bucket therefore means rewriting metadata (Iceberg ships a <code>rewriteTablePath</code> action for copies). The S3 endpoint hostname lives in client configuration, so moving the store to new hardware with the same bucket names does not touch metadata. Choose bucket names once.</li>
+<li>Column statistics are collected for the first 100 columns by default (<code>write.metadata.metrics.max-inferred-column-defaults</code>) in <code>truncate(16)</code> mode, which keeps the first 16 characters of string bounds. A loan tape with 300 columns gets no min/max on column 250 unless you name it with <code>write.metadata.metrics.column.&lt;col&gt;</code>.</li>
+<li>You can query the tree directly. Trino exposes <code>"fo_ticks$snapshots"</code>, <code>$manifests</code>, <code>$files</code>, <code>$partitions</code>, <code>$history</code> and <code>$refs</code>; Spark exposes the same as <code>markets.fo_ticks.snapshots</code> and so on. Most diagnosis starts there.</li>
+</ul></aside>
+<p class="src">Sources: <a href="https://iceberg.apache.org/spec/">Iceberg table spec</a> · <a href="https://iceberg.apache.org/docs/latest/configuration/">Iceberg configuration</a> · <a href="https://iceberg.apache.org/docs/latest/maintenance/">Iceberg maintenance</a> · <a href="https://trino.io/docs/current/connector/iceberg.html">Trino Iceberg connector</a></p>
+
+<h3>Walking one query down the tree</h3>
+<p>Take a table of NSE F&amp;O ticks, <code>markets.fo_ticks</code>, partitioned by <code>day(ts)</code> and <code>bucket(16, underlying)</code> and sorted inside each file by <code>underlying</code>, <code>contract</code>, <code>ts</code>. An analyst asks for traded value of NIFTY options in the first hour of 13 October 2026.</p>
+<pre><code class="lang-sql">SELECT contract, sum(price * qty) AS traded_value
+FROM markets.fo_ticks
+WHERE underlying = 'NIFTY'
+  AND ts &gt;= TIMESTAMP '2026-10-13 09:15:00 Asia/Kolkata'
+  AND ts &lt;  TIMESTAMP '2026-10-13 10:15:00 Asia/Kolkata'
+GROUP BY contract;</code></pre>
+<p>The counts below are illustrative, chosen to show the shape of the work.</p>
+<ol>
+<li><b>Catalog.</b> One call returns the location of <code>00042-...metadata.json</code>.</li>
+<li><b>Metadata file.</b> The engine reads it, finds the current snapshot, the schema and the partition specs, and gets the manifest list location. No other snapshot is touched.</li>
+<li><b>Manifest list.</b> Suppose it lists 40 manifests. The engine turns the filter on <code>ts</code> into a filter on the partition field <code>ts_day</code> (Iceberg calls this an <dfn>inclusive projection</dfn>: any row that matches the query must sit in a matching partition) and computes <code>bucket(16, 'NIFTY')</code>. Partition summaries show 38 manifests cover other days, so they are never opened.</li>
+<li><b>Manifests.</b> The two remaining manifests list, say, 3,000 files. Partition values cut that to the 60 files for 13 October in NIFTY's bucket. Column bounds on <code>ts</code> and <code>underlying</code> cut it again: because files are sorted, most files cover a narrow time slice, and only 6 overlap 09:15 to 10:15.</li>
+<li><b>Data files.</b> For each of the 6 files the engine issues a range GET for the Parquet footer, then range GETs for only the <code>price</code>, <code>qty</code>, <code>contract</code>, <code>ts</code> and <code>underlying</code> column chunks of row groups whose statistics overlap the filter.</li>
+<li><b>Deletes.</b> If any delete files or deletion vectors apply to those 6 files, the engine reads them and drops the deleted rows.</li>
+</ol>
+<pre class="mermaid">flowchart TD
+  Q["Query NIFTY 09:15 to 10:15 on 13 Oct"] --> C["Catalog returns pointer to metadata v42"]
+  C --> M["metadata.json picks current snapshot"]
+  M --> L["Manifest list with 40 manifests"]
+  L -->|"partition summaries"| S1["38 manifests skipped"]
+  L --> F["2 manifests opened listing 3000 files"]
+  F -->|"partition values"| P["60 files for the day and bucket"]
+  P -->|"min and max on ts"| R["6 files read"]
+  R -->|"footer stats"| G["Only matching row groups and 5 columns fetched"]</pre>
+<p>Without the sort order, step 4 prunes much less: if each file holds ticks from the whole day, every file's <code>ts</code> range overlaps the hour and all 60 files are read. Partitioning decides which files are candidates; sorting decides how tight each file's statistics are.</p>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Planning usually happens on one node (the Trino coordinator, the StarRocks or Doris frontend (FE) node, the Spark driver). Spark can switch to distributed planning for very large tables (<code>read.data-planning-mode</code>), and a REST catalog may offer server-side planning, but the single-node case is the common one. When queries are slow before any data moves, the cause is usually metadata: thousands of manifests, a large metadata file, or a cold metadata cache.</li>
+<li>The Iceberg Java library reports scan metrics such as scanned and skipped data manifests, result data files, skipped data files and delete files used. REST catalogs can receive these reports through a metrics endpoint, which is a cheap way to see pruning effectiveness per table.</li>
+<li>A filter wrapped in a function that Iceberg cannot project (for example a cast of <code>ts</code> to a string) often defeats pruning. Engines differ in what they can push down, so check the plan.</li>
+<li>Bucket pruning works only for equality and IN filters. <code>underlying LIKE 'NIFTY%'</code> cannot use <code>bucket(16, underlying)</code>.</li>
+</ul></aside>
+<p class="src">Sources: <a href="https://iceberg.apache.org/spec/">Iceberg spec, scan planning</a> · <a href="https://iceberg.apache.org/docs/latest/metrics-reporting/">Iceberg metrics reporting</a> · <a href="https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml">REST catalog OpenAPI</a></p>
+
+<h3>Commits: optimistic concurrency and the pointer swap</h3>
+<p>Iceberg never locks a table for the length of a job. It uses <dfn>optimistic concurrency</dfn>: each writer assumes nobody else will commit, does all its work, and checks only at the end. A write goes through six steps.</p>
+<ol>
+<li>Load the table: the current metadata file is v41 and the current snapshot is S41.</li>
+<li>Write new data files (and delete files, if the operation removes rows).</li>
+<li>Write a new manifest that lists the new files.</li>
+<li>Write a new manifest list: the manifests of S41 plus the new one.</li>
+<li>Write metadata file v42, which adds snapshot S42 with parent S41.</li>
+<li>Ask the catalog to change the table's pointer from v41 to v42 only if it still points at v41. This <dfn>compare-and-swap</dfn> is the commit. Until it succeeds, nobody sees the new files; after it succeeds, every reader that loads the table sees S42.</li>
+</ol>
+<p>If the swap fails because another writer committed first, the writer reloads the table, checks that its assumptions still hold, rewrites only its small metadata files (the manifest list and metadata file, plus any manifests it merges) on top of the new state, and tries again. Data files are reused across retries, so a retry costs a few small metadata writes. The Java defaults are 4 retries (<code>commit.retry.num-retries</code>), waits from 100 ms up to 60 seconds, and 30 minutes in total.</p>
+<p>Each catalog type implements the swap differently, and that difference decides whether concurrent writers are safe.</p>
+<div class="tw"><table><thead><tr><th>Catalog type</th><th>How the swap is made atomic</th></tr></thead><tbody>
+<tr><td>JDBC (Postgres)</td><td>An <code>UPDATE</code> of the table's row that sets the new metadata location <code>WHERE</code> the stored location still equals the old one; one row updated means success.</td></tr>
+<tr><td>Hive Metastore</td><td>A metastore lock around changing the table parameter that holds the metadata location.</td></tr>
+<tr><td>REST</td><td>Done by the server. The client sends requirements such as <code>assert-ref-snapshot-id</code>; if one fails the server returns HTTP 409 and the client may retry.</td></tr>
+<tr><td>AWS Glue</td><td>Glue's optimistic locking: the update succeeds only if the table's version ID is unchanged.</td></tr>
+<tr><td>Nessie</td><td>A commit on a Nessie branch that names the expected previous state.</td></tr>
+<tr><td>Hadoop (file-system) catalog</td><td>An atomic rename of a version file. The spec says file-system tables need atomic rename, which object stores do not offer, so this type is unsafe for concurrent writers on S3-compatible storage. The spec also marks this commit scheme deprecated and slated for removal in v4.</td></tr>
+</tbody></table></div>
+
+<h4>What two concurrent writers see</h4>
+<p>Both writers below start from snapshot S41 of <code>risk.positions_eod</code>.</p>
+<ul>
+<li><b>Two appends.</b> The equities loader and the MCX loader both append rows for 13 October. The equities loader commits S42. The MCX loader's swap fails, it reloads, sees that an append makes no assumption about existing files, rebuilds its manifest list on top of S42 and commits S43. Both succeed; the only cost is one retry.</li>
+<li><b>A correction against a late append.</b> An end-of-day (EOD) job runs <code>MERGE</code> to correct quantities for book B7 on 13 October, reading S41. Meanwhile a late trade file for the same date is appended as S42. When the MERGE tries to commit, Iceberg checks whether any data file matching the MERGE's filter was added since S41. One was, so under the default <dfn>serializable</dfn> isolation the commit fails with a validation error and the job must rerun. Under <dfn>snapshot</dfn> isolation (<code>write.merge.isolation-level=snapshot</code>) it would commit, and the late trades would never have been seen by the correction.</li>
+<li><b>Compaction against a delete.</b> A compaction job rewrites files F1 and F2 into one larger file while a DELETE removes a cancelled trade from F1. Compaction's assumption is that F1 and F2 are still live with no new deletes; if the DELETE committed first, that compaction group fails and is retried later.</li>
+</ul>
+<pre class="mermaid">flowchart LR
+  A["Writer A MERGE book B7 from S41"] --> CA["Swap v41 to v42"]
+  B["Writer B late trades from S41"] --> CB["Swap v41 to v42"]
+  CB -->|"wins first"| S42["S42 committed"]
+  CA -->|"409 conflict"| RV["Reload S42 and validate"]
+  RV -->|"new files in same filter"| X["Serializable fails, rerun"]
+  RV -->|"no overlap"| S43["Rebase and commit S43"]</pre>
+<p>In summary: readers get <dfn>snapshot isolation</dfn> (each query reads one committed snapshot and never blocks or is blocked), and commits to one table form a single linear history. For row-level writes Iceberg Java defaults to serializable validation for delete, update and merge. Core Iceberg has no multi-table transaction: each table commits on its own. The REST catalog spec defines a <code>/transactions/commit</code> endpoint for atomic commits across tables, which a catalog may implement, and Nessie offers commits that span tables on one branch.</p>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> The mutual fund's NAV inputs table shows two copies of 13 October holdings for one scheme, and the computed NAV per unit is wrong. <b>Diagnosis.</b> The load task's commit call timed out at a load balancer (HTTP 504). The REST spec treats 500, 502 and 504 on commit as <code>CommitStateUnknown</code>: the commit may or may not have landed. The orchestrator retried the whole task, which appended the same rows again. The <code>$snapshots</code> table shows two append snapshots a few seconds apart with identical record counts. <b>Fix.</b> Roll back to the snapshot before the duplicate, then make the load idempotent: overwrite that date's partition, or <code>MERGE</code> on the holding key, or stamp each commit's summary with a run ID and check for it before appending. <b>Lesson.</b> A commit with an unknown outcome must be checked before any retry. The Iceberg Java client deliberately keeps the written files in this state because the commit may have succeeded.</p></aside>
+<p class="src">Sources: <a href="https://iceberg.apache.org/spec/">Iceberg spec</a> · <a href="https://iceberg.apache.org/docs/latest/reliability/">Iceberg reliability</a> · <a href="https://iceberg.apache.org/docs/latest/configuration/">Iceberg configuration</a> · <a href="https://iceberg.apache.org/docs/latest/aws/">Iceberg AWS (Glue locking)</a> · <a href="https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml">REST catalog OpenAPI</a></p>
+
+<h3>Snapshots, time travel, rollback, branches and tags</h3>
+<p>Because every commit produces a new snapshot and old files stay until they are expired, you can read the table as it was at any retained snapshot. That is <dfn>time travel</dfn>.</p>
+<pre><code class="lang-sql">-- Spark SQL
+SELECT * FROM mf.nav_inputs VERSION AS OF 8812034412233;
+SELECT * FROM mf.nav_inputs TIMESTAMP AS OF '2026-09-30 23:59:59';
+-- Trino
+SELECT * FROM mf.nav_inputs FOR VERSION AS OF 8812034412233;
+SELECT * FROM mf.nav_inputs FOR TIMESTAMP AS OF TIMESTAMP '2026-09-30 23:59:59 Asia/Kolkata';</code></pre>
+<p><dfn>Rollback</dfn> moves the table's current snapshot back to an earlier one, for example after a bad load: in Spark, <code>CALL lake.system.rollback_to_snapshot('mf.nav_inputs', 8812034412233)</code>. It is a metadata commit; no data is copied.</p>
+<p>Iceberg also keeps named <dfn>references</dfn> to snapshots. A <dfn>tag</dfn> is a fixed name for one snapshot, such as <code>eom-2026-09</code>, with its own retention, so the month-end state survives routine snapshot expiry. A <dfn>branch</dfn> is a movable name for a line of snapshots; <code>main</code> is the branch everyone reads by default. Branches carry their own retention settings (minimum snapshots to keep, maximum snapshot age, maximum age of the reference itself).</p>
+<pre><code class="lang-sql">-- keep the September month-end state for a year (Spark SQL)
+ALTER TABLE mf.nav_daily CREATE TAG `eom-2026-09` AS OF VERSION 8812034412233 RETAIN 365 DAYS;
+-- an audit branch retained for 7 days (RETAIN sets the branch's maximum age; snapshot expiry removes it after that)
+ALTER TABLE risk.positions_eod CREATE BRANCH `audit-20261013` RETAIN 7 DAYS;</code></pre>
+
+<h4>Write-audit-publish</h4>
+<p><dfn>Write-audit-publish</dfn> (WAP) is a pattern for keeping bad data away from readers: write the new data somewhere readers do not look, run checks on it, and publish only if the checks pass. Iceberg supports it two ways.</p>
+<ul>
+<li><b>Branch style.</b> Set <code>write.wap.enabled=true</code>, create an audit branch, point the writer at it with <code>spark.wap.branch</code>, validate the branch, then move <code>main</code> to the branch head with <code>CALL lake.system.fast_forward('risk.positions_eod', 'main', 'audit-20261013')</code>.</li>
+<li><b>Staged-snapshot style.</b> With <code>spark.wap.id</code> set, a write creates a snapshot that is not made current. After validation, <code>publish_changes</code> (or <code>cherrypick_snapshot</code>) makes it current. Only append and dynamic-overwrite snapshots can be published this way.</li>
+</ul>
+<pre class="mermaid">flowchart LR
+  W["EOD position load"] -->|"write"| B["Branch audit-20261013"]
+  B --> V["Checks row counts, nulls, P and L reconciliation"]
+  V -->|"pass"| F["fast_forward main to branch"]
+  V -->|"fail"| D["Leave main untouched and alert"]
+  F --> R["Readers on main see the new snapshot"]</pre>
+<p class="src">Sources: <a href="https://iceberg.apache.org/docs/latest/branching/">Iceberg branching and tagging</a> · <a href="https://iceberg.apache.org/docs/latest/spark-procedures/">Iceberg Spark procedures</a> · <a href="https://iceberg.apache.org/docs/latest/spark-queries/">Iceberg Spark queries</a> · <a href="https://trino.io/docs/current/connector/iceberg.html">Trino Iceberg connector</a></p>
+
+<h3>Schema evolution by field IDs</h3>
+<p>Every column in an Iceberg schema has a <dfn>field ID</dfn>, an integer assigned when the column is created and never reused. Iceberg writers store these IDs inside each Parquet file's schema, and readers match file columns to table columns by that ID alone. That one rule makes the following changes metadata-only, with no data rewritten:</p>
+<ul>
+<li><b>Add</b> a column (old files read it as null, or as its default in v3).</li>
+<li><b>Drop</b> a column (the bytes stay in old files until they are rewritten; readers ignore them).</li>
+<li><b>Rename</b> a column or nested field.</li>
+<li><b>Reorder</b> columns.</li>
+<li><b>Widen</b> a type: <code>int</code> to <code>long</code>, <code>float</code> to <code>double</code>, <code>decimal(P,S)</code> to a larger P with the same scale. Format v3 also allows <code>date</code> to <code>timestamp</code> or <code>timestamp_ns</code>.</li>
+</ul>
+<p>Format v3 adds <dfn>default values</dfn>: an <code>initial-default</code> that old rows read for a newly added column, and a <code>write-default</code> used when a writer omits it. Files that were written without field IDs (for example Parquet from an old Hive table brought in with <code>add_files</code>) need a <dfn>name mapping</dfn>, a table property that maps column names to IDs.</p>
+<aside class="box trap"><b class="lbl">Common mistake</b><p>Dropping a column and adding a new one with the same name to "reset" it. The new column gets a new field ID, so every existing row reads null for it, and the old values are still sitting in the old files. The reverse also bites: dropping <code>investor_pan</code> from a mutual fund table does not erase anyone's PAN (the Indian tax identifier). To remove personal data you must rewrite the affected files, expire the snapshots that reference the old files, and let orphan cleanup delete them.</p></aside>
+<p class="src">Sources: <a href="https://iceberg.apache.org/docs/latest/evolution/">Iceberg evolution</a> · <a href="https://iceberg.apache.org/spec/">Iceberg spec, schema evolution and default values</a></p>
+
+<h3>Hidden partitioning and partition evolution</h3>
+<p>In Iceberg a partition spec is a list of <dfn>partition transforms</dfn>, functions that derive a partition value from a column. Iceberg computes the value on write, stores it in the manifest, and converts query filters on the source column into partition filters. Users filter on <code>ts</code> and never see a <code>trade_date</code> partition column. That is <dfn>hidden partitioning</dfn>.</p>
+<div class="tw"><table><thead><tr><th>Transform</th><th>What it does</th><th>Example</th></tr></thead><tbody>
+<tr><td><code>identity</code></td><td>The value itself</td><td><code>exchange</code> (NSE, BSE, MCX) on a cross-exchange EOD price table; low cardinality only</td></tr>
+<tr><td><code>bucket[N]</code></td><td>32-bit Murmur3 hash of the value, modulo N</td><td><code>bucket(16, underlying)</code> on ticks; <code>bucket(32, loan_id)</code> on loan cash flows</td></tr>
+<tr><td><code>truncate[W]</code></td><td>Integers and decimals rounded down to a multiple of W; strings cut to W characters</td><td>Rarely needed; grouping long string keys by prefix</td></tr>
+<tr><td><code>year</code>, <code>month</code>, <code>day</code>, <code>hour</code></td><td>Time units since 1970</td><td><code>day(ts)</code> on ticks; <code>month(payment_date)</code> on structured-credit cash flows; <code>month(trade_date)</code> on EOD bhavcopy prices</td></tr>
+<tr><td><code>void</code></td><td>Always null; used to retire a partition field in v1 tables</td><td>Partition evolution on old tables</td></tr>
+</tbody></table></div>
+<p><dfn>Partition evolution</dfn> means changing the spec on a live table. Each change creates a new spec with a new ID. Existing files keep the spec they were written with, new files use the new one, and the planner evaluates each manifest against its own spec (Iceberg calls this split planning). Nothing is rewritten unless you choose to compact old data into the new layout.</p>
+<pre><code class="lang-sql">-- Spark SQL: ticks grew, so move from daily to hourly partitions from now on
+ALTER TABLE markets.fo_ticks REPLACE PARTITION FIELD ts_day WITH hours(ts);
+-- give the planner a sort order to keep file statistics tight
+ALTER TABLE markets.fo_ticks WRITE ORDERED BY underlying, contract, ts;</code></pre>
+<p>How fine to partition is a judgement call. My rule of thumb, derived from the 512 MB default target file size: if a partition would receive less than one target-size file of data per load cycle, it is too fine, and the sort order should do the rest of the pruning. A daily NAV table for a handful of schemes is a few thousand rows a year and should not be partitioned at all.</p>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Engines spell bucket differently. Spark writes <code>bucket(16, underlying)</code>; Trino's table property is <code>partitioning = ARRAY['day(ts)', 'bucket(underlying, 16)']</code> with the arguments reversed.</li>
+<li>Changing the number of buckets is a partition evolution. Old files keep the old bucket count, so a lookup by key may have to check both layouts until old data is rewritten.</li>
+<li>Partition on what queries filter by, sort on what they filter by next. For ticks that is usually time first, then underlying or symbol.</li>
+<li>Trino limits how many partitions one writer task handles (<code>iceberg.max-partitions-per-writer</code>, default 100). A backfill that touches a year of daily partitions in one INSERT can fail on this limit.</li>
+</ul></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> Simple queries on the options tick table spend most of their time in planning, and the object store reports millions of tiny objects under one table. <b>Diagnosis.</b> The table was partitioned by <code>day(ts)</code> and <code>identity(contract)</code>. Thousands of option contracts trade each day, many with few ticks, so each load cycle wrote one small file per contract per partition. Manifests grew with every file, and planning read them all. <b>Fix.</b> Evolve the spec to <code>day(ts)</code> plus <code>bucket(16, underlying)</code>, set a sort order of underlying, contract and ts, and compact recent partitions into the new spec with the rewrite job's output spec option. <b>Lesson.</b> High-cardinality columns belong in a bucket transform or in the sort order. Identity partitioning on them recreates the small-files problem inside the metadata.</p></aside>
+<p class="src">Sources: <a href="https://iceberg.apache.org/spec/">Iceberg spec, partition transforms</a> · <a href="https://iceberg.apache.org/docs/latest/partitioning/">Iceberg partitioning</a> · <a href="https://iceberg.apache.org/docs/latest/evolution/">Iceberg partition evolution</a> · <a href="https://trino.io/docs/current/connector/iceberg.html">Trino Iceberg connector</a></p>
+
+<h3>Row-level changes: copy-on-write, merge-on-read and three kinds of delete</h3>
+<p>Data files are immutable, so changing one row needs a strategy. A trade is cancelled, a price is corrected, a loan prepays. Iceberg offers two families.</p>
+<ul>
+<li><dfn>Copy-on-write</dfn> (CoW): rewrite every data file that contains an affected row, minus the deleted rows or with updated values. Writes are expensive (a 512 MB file is rewritten to change one row); reads cost nothing extra. It is the Iceberg Java default for delete, update and merge (<code>write.delete.mode</code>, <code>write.update.mode</code>, <code>write.merge.mode</code>).</li>
+<li><dfn>Merge-on-read</dfn> (MoR): leave the data file alone and write a small delete record; readers merge the two at query time. Writes are cheap; reads pay until compaction folds the deletes in.</li>
+</ul>
+<p>MoR has three encodings of "this row is gone".</p>
+<div class="tw"><table><thead><tr><th>Encoding</th><th>Identifies a row by</th><th>Format versions</th><th>Read cost</th><th>Typical writer</th></tr></thead><tbody>
+<tr><td><dfn>Position delete file</dfn></td><td>Data file path plus row position</td><td>v2; new ones prohibited in v3 (existing ones stay valid)</td><td>Join on file and position; cheap if few</td><td>Spark MoR on v2, Trino, StarRocks 4.1 DELETE</td></tr>
+<tr><td><dfn>Equality delete file</dfn></td><td>Column values, for example <code>trade_id = 'T-20261013-0042'</code></td><td>v2 and v3; new ones prohibited in v4</td><td>Must be checked against every older data file in the same partition; an unpartitioned equality delete applies to the whole table</td><td>Streaming upserts, typically Flink jobs applying change data capture (CDC) from an operational database</td></tr>
+<tr><td><dfn>Deletion vector</dfn> (DV)</td><td>A bitmap of deleted positions for one data file, stored in a Puffin file</td><td>v3 and later</td><td>Lowest: at most one bitmap per data file, read with it</td><td>Spark, Doris and DuckDB on v3 tables</td></tr>
+</tbody></table></div>
+<p>Sequence numbers decide which deletes apply to which files. A position delete or DV applies to data files with a sequence number less than or equal to its own; an equality delete applies only to data files with a strictly smaller sequence number. All three apply only within their own partition, with one exception: an equality delete stored with an unpartitioned spec applies to the whole table. That is why a row re-inserted after an equality delete survives. It is also why the compaction job, by default, commits its new files with the sequence number of the snapshot it started from (<code>use-starting-sequence-number</code>): equality deletes committed while it ran still apply to the compacted rows.</p>
+<div class="tw"><table><thead><tr><th>Engine (as of Oct 2026)</th><th>Row-level writes on Iceberg</th></tr></thead><tbody>
+<tr><td>Spark with Iceberg 1.12</td><td>DELETE, UPDATE, MERGE in CoW or MoR; position deletes on v2, DVs on v3</td></tr>
+<tr><td>Trino 483</td><td>DELETE, UPDATE, MERGE with position delete files on v2; v3 is experimental with no row-level operations</td></tr>
+<tr><td>StarRocks 4.1</td><td>DELETE via position delete files (INSERT and INSERT OVERWRITE since 3.1)</td></tr>
+<tr><td>Doris 4.1</td><td>UPDATE, DELETE, MERGE INTO, experimental since 4.1.0; position deletes on v2, DVs on v3</td></tr>
+<tr><td>DuckDB iceberg extension</td><td>UPDATE and DELETE since 1.4.2, merge-on-read only, unsorted tables only, through a REST catalog; position deletes on v2, DVs on v3</td></tr>
+<tr><td>PyIceberg 0.12</td><td><code>delete</code> (rewrites affected files), <code>overwrite</code> with a filter, <code>upsert</code></td></tr>
+<tr><td>ClickHouse 26.9</td><td>DELETE experimental; UPDATE and MERGE unsupported</td></tr>
+</tbody></table></div>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Choose per table. Append-only ticks need neither mode. EOD positions with daily whole-partition reloads suit INSERT OVERWRITE. Trade corrections a few times a day suit MoR plus nightly compaction. A table updated row by row all day long belongs in Postgres or in a primary-key table of the massively parallel processing (MPP) engine, with periodic export to Iceberg.</li>
+<li>MoR moves cost from writers to every reader. Watch the count of delete files per partition in <code>$files</code> (content 1 is position deletes, 2 is equality deletes) and compact before readers feel it.</li>
+<li>Equality deletes are the most expensive to read. The v4 draft bans writing new ones, a clear signal that the community is moving away from them.</li>
+</ul></aside>
+<p class="src">Sources: <a href="https://iceberg.apache.org/spec/">Iceberg spec, delete formats and scan planning</a> · <a href="https://iceberg.apache.org/docs/latest/configuration/">Iceberg configuration</a> · <a href="https://trino.io/docs/current/connector/iceberg.html">Trino Iceberg connector</a> · <a href="https://docs.starrocks.io/docs/introduction/Architecture/">StarRocks docs</a> · <a href="https://doris.apache.org/docs/dev/lakehouse/catalogs/iceberg-catalog">Doris Iceberg catalog</a> · <a href="https://duckdb.org/docs/current/core_extensions/iceberg/writing_to_iceberg.html">DuckDB Iceberg writes</a> · <a href="https://py.iceberg.apache.org/api/">PyIceberg API</a> · <a href="https://clickhouse.com/docs/use-cases/data-lake/support-matrix">ClickHouse data lake support matrix</a></p>
+
+<h3>Format versions: what v3 adds and what v4 proposes</h3>
+<p>A table's <dfn>format version</dfn> (property <code>format-version</code>) says which spec rules its metadata follows. v1 covered analytic tables, v2 added row-level deletes and is the Java default since Iceberg 1.4.0, and v3 extends types and capabilities. An engine that does not understand a table's version must refuse to read it.</p>
+<div class="tw"><table><thead><tr><th>Version</th><th>Feature</th><th>Why it matters</th></tr></thead><tbody>
+<tr><td>v3</td><td>Deletion vectors</td><td>Cheaper trade corrections and cancellations</td></tr>
+<tr><td>v3</td><td>Row lineage (a stable row ID and last-updated sequence number per row)</td><td>Incremental processing and an audit trail of which load changed a row</td></tr>
+<tr><td>v3</td><td>Variant type</td><td>Semi-structured vendor payloads and agent tool outputs without flattening</td></tr>
+<tr><td>v3</td><td>Column default values</td><td>Add a column with a default without rewriting files</td></tr>
+<tr><td>v3</td><td>Nanosecond timestamps (<code>timestamp_ns</code>, <code>timestamptz_ns</code>)</td><td>Feeds that stamp events finer than microseconds</td></tr>
+<tr><td>v3</td><td>Table encryption keys, multi-argument transforms, geometry and geography, the unknown type</td><td>Encryption metadata in the table; partitioning on two columns at once</td></tr>
+<tr><td>v4 draft</td><td>Relative paths in metadata; a <code>content_stats</code> struct in manifests that stores column statistics as typed values instead of binary-encoded maps; no new equality deletes</td><td>Moving tables between buckets without rewriting metadata</td></tr>
+<tr><td>v4 proposals</td><td>Adaptive metadata tree, single-file commits (not yet in the spec text)</td><td>Faster commits for high-frequency writers; not adopted</td></tr>
+</tbody></table></div>
+<aside class="box asof"><b class="lbl">As of Oct 2026</b><p>Spec versions 1 to 3 are complete and adopted; v4 is under active development and not adopted. Iceberg 1.12.0 (30 Sep 2026) contains the first v4 work (v4 manifests, relative paths), lets the encrypting FileIO act as a DelegateFileIO, and adds a REST unregister-table endpoint. Iceberg 1.11.0 (20 May 2026) added built-in envelope encryption through a key management service (KMS) and manifest-list encryption. Engine support for v3 is uneven: Trino calls v3 experimental with no row-level operations or OPTIMIZE, ClickHouse supports v3 partially, and Doris reads deletion vectors since 4.1.0. A reasonable default for shared tables is format v2 until the proof of concept (POC) proves that every engine in the stack reads and writes v3.</p></aside>
+<p class="src">Sources: <a href="https://iceberg.apache.org/spec/">Iceberg spec</a> · <a href="https://github.com/apache/iceberg/releases">Iceberg releases</a> · <a href="https://trino.io/docs/current/connector/iceberg.html">Trino Iceberg connector</a> · <a href="https://clickhouse.com/docs/use-cases/data-lake/support-matrix">ClickHouse support matrix</a> · <a href="https://doris.apache.org/docs/dev/lakehouse/catalogs/iceberg-catalog">Doris Iceberg catalog</a></p>
+
+<h3>Iceberg, Delta Lake and Hudi</h3>
+<p>Two other open table formats solve the same problem. <dfn>Delta Lake</dfn> came from Databricks and keeps an ordered log of commit files. <dfn>Apache Hudi</dfn> came from Uber and was built first for upsert-heavy ingestion.</p>
+<div class="tw"><table><thead><tr><th></th><th>Iceberg</th><th>Delta Lake</th><th>Hudi</th></tr></thead><tbody>
+<tr><td>Metadata model</td><td>Tree: metadata.json, manifest list, manifests</td><td>Log of numbered JSON commit files in <code>_delta_log/</code> plus periodic Parquet checkpoints</td><td>Timeline of actions in <code>.hoodie/</code> plus an internal metadata table</td></tr>
+<tr><td>Commit</td><td>Compare-and-swap in a catalog</td><td>Create the next log file only if it does not exist, which the storage or a coordinator must guarantee</td><td>Timeline with a lock provider for multiple writers</td></tr>
+<tr><td>Row-level changes</td><td>CoW, or MoR with position deletes, equality deletes, deletion vectors</td><td>CoW plus deletion vectors</td><td>Copy-on-write and merge-on-read table types, with record-level indexes</td></tr>
+<tr><td>Partitioning</td><td>Hidden partitioning with evolution</td><td>Explicit partition columns, plus liquid clustering</td><td>Explicit partition paths</td></tr>
+<tr><td>Open catalog API</td><td>Iceberg REST spec, implemented by many catalogs</td><td>Unity Catalog</td><td>Usually synced to a Hive-style metastore</td></tr>
+<tr><td>Fit for a typical shortlist</td><td>Read and write support in StarRocks, Doris, Trino, Spark, DuckDB, PyIceberg; reads in ClickHouse</td><td>Strongest in Spark</td><td>Strongest in Spark and Flink</td></tr>
+</tbody></table></div>
+<p>My view: for a self-hosted, multi-engine lake whose stated goal is no vendor lock-in, Iceberg is the natural default because of engine breadth and an open catalog protocol. Delta would make sense if Spark were the centre of the platform, and Hudi if most data arrived as high-rate upserts.</p>
+<p class="src">Sources: <a href="https://docs.delta.io/latest/delta-intro.html">Delta Lake docs</a> · <a href="https://hudi.apache.org/docs/table_types">Hudi table types</a> · <a href="https://www.cidrdb.org/cidr2021/papers/cidr2021_paper17.pdf">Lakehouse, CIDR 2021</a></p>
+
+<h3>Putting it together</h3>
+<aside class="box senior"><b class="lbl">Senior lens</b><p>Iceberg is a protocol between engines, and the table is only as correct as its least careful writer. That drives four decisions. First, pick the format version and features by the weakest engine that must write, which in Oct 2026 probably means v2 for shared tables. Second, give each table one owning writer pipeline and let other engines read, because concurrent writers from different engines multiply commit conflicts and semantic surprises. Third, treat metadata as the new bottleneck: the small-files problem has moved from HDFS NameNode memory into manifests and metadata files, and it is paid for in planning time and maintenance compute. Fourth, keep row-at-a-time work out of Iceberg: positions updated per trade belong in Postgres or an MPP primary-key table, with Iceberg receiving batched snapshots.</p></aside>
+<aside class="box trap"><b class="lbl">Common mistake</b><p>Treating an Iceberg table like an OLTP table: committing every tick batch every few seconds, or updating single rows as trades arrive. Each commit is a snapshot plus new metadata files, so this creates thousands of snapshots a day, tiny files and growing metadata. Buffer in the MPP engine or a queue and commit to Iceberg every few minutes, or at least once per load cycle.</p></aside>
+<dl class="nums">
+<dt>1</dt><dd>Atomic pointer swap per commit; everything else a writer produces is new, immutable files.</dd>
+<dt>4 retries</dt><dd>Java default <code>commit.retry.num-retries</code>; waits from 100 ms to 60 s, 30 minutes in total.</dd>
+<dt>409 vs 5xx</dt><dd>REST commit: 409 means a conflict, safe to retry; 500, 502 and 504 mean the outcome is unknown and must be checked.</dd>
+<dt>v2</dt><dd>Java default format version since Iceberg 1.4.0.</dd>
+<dt>512 MB / 128 MB / zstd</dt><dd>Java defaults for target data file size, Parquet row group size and Parquet codec.</dd>
+<dt>100 columns, truncate(16)</dt><dd>Columns that get min/max statistics by default, and the string-bound truncation mode.</dd>
+<dt>Murmur3, 32-bit</dt><dd>Hash behind <code>bucket[N]</code>, so every engine assigns the same bucket.</dd>
+<dt>5 days, keep 1</dt><dd>Default snapshot expiry age and minimum snapshots kept; time travel ends there unless you tag.</dd>
+<dt>1,440</dt><dd>Snapshots per day if a writer commits once a minute (simple arithmetic).</dd>
+</dl>
+<aside class="box say"><b class="lbl">Say this</b><p>"I haven't run Iceberg in production, so let me explain how I reason about it. Iceberg turns a table into a tree of immutable files: a metadata file per version, a manifest list per snapshot, and manifests that carry per-file partition values and column statistics. A query walks that tree and prunes at each level, so it never lists directories. A commit writes new files and then does one compare-and-swap of the table's pointer in the catalog, which gives readers snapshot isolation and writers optimistic concurrency with retries. On top of that you get time travel, rollback, branches for write-audit-publish, schema evolution by field ID and partition evolution without rewrites. I'd keep shared tables on format v2 until every engine in the POC handles v3, give each table a single owning writer, and choose copy-on-write or merge-on-read per table based on how often rows change."</p></aside>
+</section>
+<section class="topic" id="iceberg-ops"><h2>Running Iceberg in production</h2>
+<p class="lede">An Iceberg table decays as it is used: every commit adds files and metadata, and nothing is removed until a maintenance job removes it. Running Iceberg well is mostly running those jobs on a schedule, sizing them, and watching the few numbers that say a table needs attention. On a managed service someone else does this; on a self-hosted lake it is a platform service the data team owns from day one.</p>
+
+<h3>Why tables decay</h3>
+<p>The <dfn>small-files problem</dfn> is the core of it: many files far below the target size. Each file costs a manifest entry at planning time, an object open and footer read at query time, and a request against the object store. Small files come from frequent appends (an ingestion job committing every few seconds), from over-fine partitions, and from merge-on-read writes that add delete files. Snapshots pile up for a related reason: every commit keeps the previous state alive for time travel until it is expired.</p>
+<div class="tw"><table><thead><tr><th>What you observe</th><th>Usual cause</th><th>Job that fixes it</th></tr></thead><tbody>
+<tr><td>Recent partitions slow; most files under a few MB</td><td>Frequent small appends or too many partitions</td><td>Rewrite data files, bin-pack strategy</td></tr>
+<tr><td>Selective queries still read most files of a partition</td><td>Rows not sorted, so every file's min and max span the whole range</td><td>Rewrite data files, sort or z-order strategy</td></tr>
+<tr><td>Planning takes seconds before any data is read; thousands of manifests</td><td>Fast appends add one manifest per commit; write pattern differs from query pattern</td><td>Rewrite manifests</td></tr>
+<tr><td>Reads on an updated table get slower each day</td><td>Delete files accumulate under merge-on-read</td><td>Rewrite data files with delete thresholds; rewrite position deletes</td></tr>
+<tr><td>Commits slow down; large metadata file</td><td>Thousands of retained snapshots; old metadata files never removed</td><td>Expire snapshots; delete old metadata after commit</td></tr>
+<tr><td>Storage grows faster than the data</td><td>Old snapshots pin replaced files; failed writes leave unreferenced files</td><td>Expire snapshots; remove orphan files</td></tr>
+</tbody></table></div>
+<p class="src">Sources: <a href="https://iceberg.apache.org/docs/latest/maintenance/">Iceberg maintenance</a></p>
+
+<h3>The maintenance jobs</h3>
+<h4>Expire snapshots</h4>
+<p><dfn>Snapshot expiry</dfn> removes old snapshots from the table metadata and then deletes every data, delete and manifest file that no retained snapshot, branch or tag still references. It is how storage is ever freed. Java defaults: expire snapshots older than 5 days (<code>history.expire.max-snapshot-age-ms</code>) but always keep at least 1 (<code>history.expire.min-snapshots-to-keep</code>). Branches and tags carry their own retention; the <code>main</code> branch never expires. Setting <code>gc.enabled=false</code> blocks garbage collection altogether (snapshot expiry and orphan removal refuse to run), which you want on tables that share files with another table (for example one created by Iceberg's snapshot or migrate procedures).</p>
+<pre><code class="lang-sql">-- Spark: keep 7 days, but never fewer than the last 50 snapshots
+CALL lake.system.expire_snapshots(
+  table =&gt; 'markets.fo_ticks',
+  older_than =&gt; TIMESTAMP '2026-10-07 00:00:00',
+  retain_last =&gt; 50,
+  stream_results =&gt; true);
+-- Trino: retention must be at least iceberg.expire-snapshots.min-retention (default 7d)
+ALTER TABLE markets.fo_ticks EXECUTE expire_snapshots(retention_threshold =&gt; '7d');</code></pre>
+<p>A related setting cleans old metadata files. Each commit leaves the previous <code>metadata.json</code> behind; with <code>write.metadata.delete-after-commit.enabled=true</code> the writer deletes the oldest tracked one after each commit, keeping <code>write.metadata.previous-versions-max</code> (default 100). The default is false, so tables that never set it accumulate one metadata file per commit forever.</p>
+
+<h4>Remove orphan files</h4>
+<p>An <dfn>orphan file</dfn> is a file under the table's location that no metadata references: output of a failed or killed write, or a metadata file that dropped out of the tracked log. <code>remove_orphan_files</code> lists everything under the table location, compares it with every file referenced by any metadata, and deletes unreferenced files older than a threshold. The threshold is the safety mechanism: a file being written by a job that has not committed yet is indistinguishable from garbage, except by age. Defaults: 3 days in Spark (<code>older_than</code>; the SQL procedure also refuses any window shorter than 24 hours, although the Java action API does not check), a 7-day minimum in Trino (<code>iceberg.remove-orphan-files.min-retention</code>), 7 days in StarRocks, 72 hours in SeaweedFS's maintenance worker.</p>
+<pre><code class="lang-sql">-- Spark: always dry-run first and read the list
+CALL lake.system.remove_orphan_files(table =&gt; 'markets.fo_ticks', dry_run =&gt; true);
+-- Trino
+ALTER TABLE markets.fo_ticks EXECUTE remove_orphan_files(retention_threshold =&gt; '7d');</code></pre>
+
+<h4>Rewrite data files (compaction)</h4>
+<p><dfn>Compaction</dfn> rewrites groups of files into fewer, larger, better-ordered files and, on the way, applies pending deletes. Spark's <code>rewrite_data_files</code> has two strategies: <dfn>bin-pack</dfn> (the default: combine small files without reordering rows) and <dfn>sort</dfn> (rewrite in the table's sort order or a given one). The sort strategy also accepts multi-column orderings, <code>zorder(...)</code> or <code>hilbert(...)</code> (<dfn>z-order</dfn> and Hilbert curves), which interleave several columns so filters on any of them prune reasonably well.</p>
+<pre><code class="lang-sql">-- Spark: compact and sort yesterday's tick partitions, committing in pieces
+CALL lake.system.rewrite_data_files(
+  table =&gt; 'markets.fo_ticks',
+  strategy =&gt; 'sort',
+  sort_order =&gt; 'underlying ASC NULLS LAST, contract ASC NULLS LAST, ts ASC NULLS LAST',
+  where =&gt; 'ts &gt;= TIMESTAMP "2026-10-13 00:00:00" AND ts &lt; TIMESTAMP "2026-10-14 00:00:00"',
+  options =&gt; map('partial-progress.enabled', 'true', 'max-concurrent-file-group-rewrites', '4'));
+-- Trino: bin-pack files under 128 MB, only for recent data
+ALTER TABLE markets.fo_ticks EXECUTE optimize(file_size_threshold =&gt; '128MB')
+WHERE CAST(ts AS DATE) &gt;= DATE '2026-10-12';</code></pre>
+<p>The options worth knowing, with Spark defaults: a file is a candidate if it is under 75% of target size (<code>min-file-size-bytes</code>) or over 180% (<code>max-file-size-bytes</code>); a group with 5 or more files is rewritten regardless (<code>min-input-files</code>); one file group holds at most 100 GB (<code>max-file-group-size-bytes</code>); 5 groups run at once (<code>max-concurrent-file-group-rewrites</code>); <code>partial-progress.enabled</code> is false, so by default the whole job commits once at the end and one failure loses everything; <code>delete-ratio-threshold</code> is 0.3, so a file with 30% or more of its rows deleted becomes a rewrite candidate; <code>output-spec-id</code> lets compaction move old data into a newer partition spec.</p>
+
+<h4>Rewrite manifests, position deletes and the rest</h4>
+<ul>
+<li><b>Rewrite manifests</b> regroups manifest entries so each manifest covers a narrow partition range, which helps planning when many small fast-append manifests exist or when the write order differs from the query order (Spark <code>rewrite_manifests</code>, Trino <code>optimize_manifests</code>). Automatic merging on write is on by default (<code>commit.manifest-merge.enabled</code>, merging once 100 manifests accumulate, into manifests of about 8 MB).</li>
+<li><b>Rewrite position delete files</b> compacts many small position delete files into fewer and drops entries that point at files no longer live (Spark <code>rewrite_position_delete_files</code>).</li>
+<li><b>Remove dangling deletes</b> drops whole delete files that no longer apply to any live data file. It is a Java action with no SQL procedure; compaction can do it with <code>remove-dangling-deletes</code>.</li>
+<li><b>Compute statistics</b> writes distinct-value sketches into a Puffin file for cost-based optimizers (Spark <code>compute_table_stats</code>; Trino <code>ANALYZE</code>, which also collects extended statistics on write by default).</li>
+</ul>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Compaction increases storage at first. The small files it replaced stay on disk until the snapshots that reference them expire, so a table compacted daily with a 7-day expiry carries roughly a week of pre-compaction copies of its recent data.</li>
+<li>Expiry and orphan jobs gather file paths on the Spark driver. For large tables set <code>stream_results =&gt; true</code>, which the Iceberg docs recommend to avoid driver out-of-memory failures.</li>
+<li>Orphan detection compares path strings. If metadata says <code>s3a://lake-silver/...</code> and the listing returns <code>s3://lake-silver/...</code>, every file looks orphaned. Spark treats <code>s3a</code> and <code>s3n</code> as <code>s3</code> by default (<code>equal_schemes</code>) and stops with an error on other prefix mismatches (<code>prefix_mismatch_mode</code> ERROR). Never change that to DELETE to make an error go away.</li>
+<li>Several Spark procedures (the rollback, cherry-pick and publish family, and <code>rewrite_manifests</code>) invalidate cached Spark plans that reference the table, so long-running notebooks may replan after they run.</li>
+</ul></aside>
+<p class="src">Sources: <a href="https://iceberg.apache.org/docs/latest/maintenance/">Iceberg maintenance</a> · <a href="https://iceberg.apache.org/docs/latest/spark-procedures/">Iceberg Spark procedures</a> · <a href="https://iceberg.apache.org/docs/latest/configuration/">Iceberg configuration</a> · <a href="https://github.com/apache/iceberg/blob/apache-iceberg-1.12.0/spark/v4.0/spark/src/main/java/org/apache/iceberg/spark/procedures/RemoveOrphanFilesProcedure.java">Spark orphan procedure source (24-hour check)</a> · <a href="https://trino.io/docs/current/connector/iceberg.html">Trino Iceberg connector</a></p>
+
+<h3>Who can run maintenance, as of Oct 2026</h3>
+<p>On a managed lakehouse the service compacts in the background. On a self-hosted stack, the job must run in some engine, and engines differ a lot in what they can do.</p>
+<div class="tw"><table><thead><tr><th>Engine or service</th><th>Compaction</th><th>Expire snapshots</th><th>Remove orphans</th><th>Rewrite manifests</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Spark with Iceberg 1.12 procedures</td><td>Yes: bin-pack, sort, z-order, Hilbert</td><td>Yes</td><td>Yes</td><td>Yes</td><td>The reference implementation; also position-delete rewrite and table stats</td></tr>
+<tr><td>Trino 483</td><td><code>optimize</code> (bin-pack under a size threshold, folds in deletes)</td><td>Yes, 7-day minimum by default</td><td>Yes, 7-day minimum by default</td><td><code>optimize_manifests</code></td><td>No OPTIMIZE on v3 tables</td></tr>
+<tr><td>StarRocks 4.x</td><td><code>rewrite_data_files</code> (compaction API from 4.0)</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Via <code>ALTER TABLE ... EXECUTE</code>; check the docs of the exact version</td></tr>
+<tr><td>Doris 4.1</td><td><code>rewrite_data_files</code> since 4.0.2</td><td>Since 4.1.0</td><td>Not found in the docs</td><td>Since 4.1.0</td><td>Also rollback, cherry-pick and fast-forward since 4.0.2</td></tr>
+<tr><td>PyIceberg 0.12</td><td>No (planned)</td><td>Yes</td><td>No</td><td>No</td><td>Fast-append writes create one manifest per commit</td></tr>
+<tr><td>SeaweedFS 4.48 table buckets</td><td>Yes, server side</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Worker jobs, disabled by default; worker defaults keep 168 hours of snapshots (at least 5) and an orphan age of 72 hours</td></tr>
+<tr><td>DuckDB, ClickHouse</td><td>No</td><td>No</td><td>No</td><td>No</td><td>Readers and limited writers only</td></tr>
+</tbody></table></div>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Pick one maintenance engine per table. Two systems compacting the same table (say SeaweedFS's worker and a Spark job) generate commit conflicts and duplicate work, and their retention settings can disagree.</li>
+<li>Table properties are the right place for policy. Engines and SeaweedFS's worker read properties such as <code>write.target-file-size-bytes</code> and the <code>history.expire.*</code> settings, so the policy lives with the table and survives a change of engine.</li>
+<li>Maintenance competes for the same CPU, memory and object-store bandwidth as queries. Run heavy rewrites outside market hours or on separate compute.</li>
+</ul></aside>
+<aside class="box asof"><b class="lbl">As of Oct 2026</b><p>PyIceberg 0.12.0 (1 Sep 2026) offers <code>table.maintenance.expire_snapshots()</code> and lists compaction as planned. Trino 483 (17 Jul 2026) treats v3 as experimental with no row-level operations or OPTIMIZE. StarRocks 4.0 (Oct 2025) added an Iceberg compaction API and 4.1 added DELETE. Doris lists <code>rewrite_data_files</code> from 4.0.2 and <code>expire_snapshots</code> and <code>rewrite_manifests</code> from 4.1.0. SeaweedFS's Iceberg maintenance runs through its worker framework and is off until enabled.</p></aside>
+<p class="src">Sources: <a href="https://iceberg.apache.org/docs/latest/spark-procedures/">Iceberg Spark procedures</a> · <a href="https://trino.io/docs/current/connector/iceberg.html">Trino Iceberg connector</a> · <a href="https://docs.starrocks.io/docs/data_source/catalog/iceberg/procedures/">StarRocks Iceberg procedures</a> · <a href="https://doris.apache.org/docs/dev/lakehouse/catalogs/iceberg-catalog">Doris Iceberg catalog</a> · <a href="https://py.iceberg.apache.org/api/">PyIceberg API</a> · <a href="https://github.com/seaweedfs/seaweedfs/wiki/Iceberg-Table-Maintenance">SeaweedFS Iceberg maintenance</a></p>
+
+<h3>Scheduling maintenance with Prefect</h3>
+<p><dfn>Prefect</dfn> is a Python orchestrator worth considering. A <dfn>flow</dfn> is a decorated Python function, a <dfn>task</dfn> is a unit inside it with its own retries and state, and a <dfn>deployment</dfn> runs a flow on a schedule. Prefect also has <dfn>global concurrency limits</dfn>, named slots that code must occupy before running, which is the simplest way to stop ingestion and maintenance from writing the same table at once.</p>
+<p>A reasonable order for one table, every night after its last load (my judgement, following the dependencies between jobs):</p>
+<ol>
+<li>Compact the partitions that stopped changing (for ticks, yesterday; for positions, dates outside the correction window), applying deletes.</li>
+<li>Expire snapshots according to the table's retention, after tagging any month-end snapshot.</li>
+<li>Rewrite manifests if the manifest count crossed a threshold.</li>
+<li>Recompute statistics for tables used in joins.</li>
+<li>Weekly, not nightly: remove orphan files with a window longer than the longest job.</li>
+<li>Read health metrics and alert.</li>
+</ol>
+<pre class="mermaid">flowchart LR
+  L["Last load of the day commits"] --> C["Compact settled partitions"]
+  C --> T["Tag month-end snapshot if due"]
+  T --> E["Expire snapshots per table policy"]
+  E --> M["Rewrite manifests if over threshold"]
+  M --> S["Compute statistics"]
+  S --> H["Health metrics and alerts"]
+  W["Weekly orphan cleanup with long window"] -.-> H</pre>
+<pre><code class="lang-python">from datetime import date, timedelta
+import trino
+from prefect import flow, task
+from prefect.concurrency.sync import concurrency
+
+def run_sql(sql: str):
+    # authentication omitted; in practice the service account's credentials come from a secrets store
+    conn = trino.dbapi.connect(host="trino.lake.internal", port=8080,
+                               user="svc-iceberg-maint", catalog="lake")
+    cur = conn.cursor()
+    cur.execute(sql)
+    return cur.fetchall()
+
+@task
+def compact(table: str, since: date):
+    # ingestion flows occupy the same named limit, so they never commit to this table at the same time
+    with concurrency(f"iceberg-write-{table}", occupy=1):
+        return run_sql(f"ALTER TABLE {table} EXECUTE optimize(file_size_threshold =&gt; '128MB') "
+                       f"WHERE CAST(ts AS DATE) &gt;= DATE '{since.isoformat()}'")
+
+@task
+def expire(table: str, keep: str):
+    with concurrency(f"iceberg-write-{table}", occupy=1):
+        return run_sql(f"ALTER TABLE {table} EXECUTE expire_snapshots(retention_threshold =&gt; '{keep}')")
+
+@task
+def health(table: str):
+    schema, name = table.split(".")
+    return run_sql(f"""SELECT count(*) AS files,
+                              avg(file_size_in_bytes) / 1048576 AS avg_mb,
+                              count_if(content = 1) AS position_delete_files,
+                              count_if(content = 2) AS equality_delete_files
+                       FROM lake.{schema}."{name}$files" """)
+
+@flow
+def nightly_iceberg_maintenance():
+    since = date.today() - timedelta(days=2)
+    for table in ["markets.fo_ticks", "markets.eq_ticks"]:
+        compact(table, since)
+        expire(table, "7d")
+        health(table)
+
+if __name__ == "__main__":
+    nightly_iceberg_maintenance.serve(name="iceberg-nightly", cron="30 1 * * *")</code></pre>
+<p>The named concurrency limits must exist before the flow runs (created once with <code>prefect gcl create &lt;name&gt; --limit 1</code>), and every ingestion flow for the table must occupy the same limit, or the guard does nothing. By default a missing limit only logs a warning and the code runs unguarded; pass <code>strict=True</code> to <code>concurrency()</code> to make it fail instead. Each job is safe to rerun: compaction and expiry are commits that either land or do not, and orphan removal only deletes files older than its window. That property matters more than the code, because the orchestrator will retry.</p>
+
+<h4>What to watch per table</h4>
+<pre><code class="lang-sql">-- Trino metadata tables
+SELECT count(*) AS snapshots, min(committed_at) AS oldest
+FROM lake.markets."fo_ticks$snapshots";
+
+SELECT count(*) AS manifests, sum(added_data_files_count) AS added_files
+FROM lake.markets."fo_ticks$manifests";
+
+SELECT partition, file_count, total_size / file_count / 1048576 AS avg_mb
+FROM lake.markets."fo_ticks$partitions"
+ORDER BY total_size DESC
+LIMIT 20;</code></pre>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Alert thresholds are my judgement, to be tuned in the POC: average file size under about 64 MB in partitions older than a day; snapshot count well above what the retention policy implies (expiry is not running); manifest count in the hundreds for a modest table; more than a few dozen delete files in one partition, or a delete ratio near Iceberg's 0.3 compaction default.</li>
+<li>Measure progress, not liveness. "The maintenance flow ran" says little; "average file size of yesterday's partition is now above 400 MB and snapshot count fell" says the job did its work.</li>
+<li>Keep a runbook per table class: append-only ticks, daily-reloaded positions, corrected trades, slowly changing reference data. Each class has different compaction windows and retention.</li>
+</ul></aside>
+<p class="src">Sources: <a href="https://docs.prefect.io/v3/how-to-guides/workflows/global-concurrency-limits">Prefect global concurrency limits</a> · <a href="https://trino.io/docs/current/connector/iceberg.html">Trino Iceberg metadata tables</a></p>
+
+<h3>The performance knobs that matter</h3>
+<div class="tw"><table><thead><tr><th>Knob</th><th>Default</th><th>When to change it</th><th>Example</th></tr></thead><tbody>
+<tr><td><code>write.target-file-size-bytes</code></td><td>512 MB</td><td>Lower it for tables corrected often under copy-on-write, because each correction rewrites whole files. Engines split large files by row group, so 512 MB rarely limits parallelism.</td><td>Ticks keep 512 MB; a trade-corrections table might use 128 MB</td></tr>
+<tr><td>Sort order (<code>WRITE ORDERED BY</code>)</td><td>None</td><td>Set it on every large table with a dominant filter; it is what makes column bounds prune</td><td>Ticks: underlying, contract, ts. Loan cash flows: deal_id, loan_id, payment_date</td></tr>
+<tr><td><code>write.distribution-mode</code></td><td>Not set; Spark requests <code>hash</code> by partition since Iceberg 1.2.0</td><td><code>range</code> when a global sort matters, for example large backfills</td><td>Backfilling a year of EOD prices</td></tr>
+<tr><td>Partition granularity</td><td>Unpartitioned</td><td>Partition by the main time filter; bucket high-cardinality keys; do not partition small tables</td><td><code>day(ts)</code> for ticks; NAV table unpartitioned</td></tr>
+<tr><td>Manifest merging</td><td>On; merge at 100 manifests into about 8 MB each</td><td>Writers that fast-append often (PyIceberg, streaming) need periodic manifest rewrites</td><td>Intraday tick loaders</td></tr>
+<tr><td>Old metadata cleanup</td><td><code>delete-after-commit</code> false; keep 100</td><td>Turn on for any table committed more than a few times a day</td><td>All ingestion tables</td></tr>
+<tr><td>Metadata caching</td><td>Spark catalog cache on, entries expire after 30 s without access; Trino coordinator metadata cache on; Trino Parquet footer cache off</td><td>Shorter caches for read-after-write needs; footer cache for repeated dashboard queries</td><td>Dashboards right after the EOD load</td></tr>
+<tr><td>Column metrics</td><td><code>truncate(16)</code> for the first 100 columns</td><td>Name filter columns explicitly on wide tables; set <code>none</code> on large free-text columns</td><td>300-column loan tapes; PDF-extracted text columns</td></tr>
+<tr><td>Parquet bloom filters</td><td>Off</td><td>Equality lookups on high-cardinality keys where min/max cannot prune; reader support varies by engine</td><td><code>isin</code>, <code>loan_id</code>, <code>investor_id</code></td></tr>
+<tr><td>Parquet row group and page</td><td>128 MB, 1 MB pages, 20,000-row page limit, zstd</td><td>Rarely; change only with a measured reason</td><td>None</td></tr>
+<tr><td>Table statistics</td><td>None until computed (Trino collects extended stats on write by default)</td><td>Join-heavy queries in Trino or Spark</td><td>Positions joined to the security master</td></tr>
+</tbody></table></div>
+<aside class="box trap"><b class="lbl">Common mistake</b><p>Assuming something compacts in the background because it did on a managed service. On a self-hosted stack nothing compacts, expires or cleans up unless a job you scheduled does it: PyIceberg cannot compact, DuckDB and ClickHouse do no maintenance, and SeaweedFS's worker is disabled by default. The first sign is usually a dashboard that got slower every week for a month.</p></aside>
+<p class="src">Sources: <a href="https://iceberg.apache.org/docs/latest/configuration/">Iceberg configuration</a> · <a href="https://iceberg.apache.org/docs/latest/spark-writes/">Iceberg Spark writes</a> · <a href="https://iceberg.apache.org/docs/latest/spark-configuration/">Iceberg Spark configuration</a> · <a href="https://trino.io/docs/current/connector/iceberg.html">Trino Iceberg connector</a></p>
+
+<h3>Incidents teams often hit</h3>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> Nightly compaction of <code>risk.positions_eod</code> fails most nights with a validation error about conflicting files, and the evening correction job sometimes fails with the same kind of error. Commit retries do not help here: a retry only rebases onto the new state, and a failed validation ends the job. <b>Diagnosis.</b> Compaction rewrites the last 7 days of <code>trade_date</code> partitions while corrections run <code>MERGE</code> into the same recent dates all evening. Each commit changes files the other one read, so serializable validation rejects whichever commits second. <b>Fix.</b> Compact only partitions outside the correction window (older than two business days), turn on <code>partial-progress.enabled</code> so finished file groups commit, and make both jobs occupy the same Prefect concurrency limit for the table. <b>Lesson.</b> Commit conflicts are a scheduling and partitioning problem. Writers that never touch the same files never conflict.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> Three weeks after go-live, tick ingestion commits that used to take a fraction of a second take several seconds, and every query on the table spends seconds in planning. The <code>metadata/</code> prefix holds hundreds of thousands of objects. <b>Diagnosis.</b> The loader commits every 10 seconds, which is 8,640 commits a day. Snapshot expiry was never scheduled, <code>write.metadata.delete-after-commit.enabled</code> was false, and each fast append added a manifest. The metadata file carries an entry for every retained snapshot and is rewritten on every commit, so commit and planning cost grew with table age. <b>Fix.</b> Commit once a minute or less (buffer in the MPP engine if fresher data is needed), expire snapshots hourly with a short retention, turn on metadata deletion after commit, rewrite manifests, then run orphan cleanup once to remove the untracked metadata files. <b>Lesson.</b> Commit frequency is a design parameter with a compounding metadata cost.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> A backfill of a year of MCX history commits successfully, and within minutes queries on the backfilled months fail with object-not-found (404) errors. <b>Diagnosis.</b> Earlier that afternoon an engineer ran Iceberg's <code>DeleteOrphanFiles</code> Spark action from a notebook with <code>olderThan</code> set to one hour to reclaim space. (The SQL procedure <code>remove_orphan_files</code> would have refused a window under 24 hours; the action API has no such check.) The backfill had been writing data files for six hours without committing, so no metadata referenced them; they looked exactly like orphans and were deleted. The backfill's commit then referenced files that no longer existed. <b>Fix.</b> Roll the table back to the snapshot before the backfill and rerun it. If bucket versioning is on, the deleted objects can be restored instead. Run orphan removal only through a wrapper whose <code>older_than</code> can never be shorter than 3 days or the longest job's runtime, whichever is greater, keep ad hoc use of the raw action out of notebooks, and run a dry run first. <b>Lesson.</b> Orphan detection cannot tell an abandoned file from an uncommitted one; only age can. Trino's 7-day minimum exists for this reason.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> A positions table kept current by change data capture (CDC) from the Postgres position-keeping system goes from second-level to minute-level reads over two weeks. <code>$files</code> shows thousands of small equality delete files. <b>Diagnosis.</b> The CDC writer runs in upsert mode and writes an equality delete keyed on <code>position_id</code> at every checkpoint. Every read must load those deletes and check them against every older data file in the same partition, and this table is unpartitioned, so each delete applies to the whole table. Nobody compacts it. <b>Fix.</b> Schedule frequent compaction that applies deletes (rewrite data files with a delete-ratio or delete-count threshold, and remove dangling deletes), partition the table so deletes are scoped, and consider serving current-state reads from the MPP engine's primary-key table while Iceberg receives periodic snapshots. <b>Lesson.</b> Equality deletes save the writer work and charge it to every reader until compaction pays it off. Budget that compaction before choosing CDC into Iceberg.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> An auditor asks for the exact position set used to strike the 31 March NAV. Time travel to that date fails because the oldest snapshot the table still holds is a few days old. <b>Diagnosis.</b> Nightly <code>expire_snapshots</code> runs with the 5-day default. Time travel only reaches retained snapshots, and the files March referenced were deleted with them. The opposite failure is also common: a team raises retention to 90 days "for time travel", and storage grows sharply because every compaction's replaced files and every overwrite's old files are kept for 90 days. <b>Fix.</b> Rebuild March from bronze source files if they still exist. Going forward, tag month-end and quarter-end snapshots with a retention set by the compliance policy, keep routine expiry short, and model the as-of dimension in the data (business date plus load timestamp) for anything that must be reproducible for years. <b>Lesson.</b> Snapshot retention is an operational window measured in days. Regulatory history needs tags or an explicit history design, and the requirement should come from compliance in writing.</p></aside>
+
+<h3>Putting it together</h3>
+<aside class="box senior"><b class="lbl">Senior lens</b><p>Treat maintenance as a product with an owner, a budget and service levels per table class: maximum small-file ratio, maximum snapshot age, maximum delete files per partition, all measured from metadata tables and alerted on. Decide which single engine runs maintenance for each table, and run it on compute that does not starve market-hours queries. Write retention into table properties and tags so it survives a change of engine. And design commit frequency up front: an ingestion path that commits every few seconds creates more maintenance work than every other table combined. In an interview I would also say what I don't know yet: the actual file counts, commit rates and delete ratios come from a POC on representative data, and the thresholds above are starting points.</p></aside>
+<dl class="nums">
+<dt>5 days, keep 1</dt><dd>Default snapshot expiry age and minimum snapshots kept (<code>history.expire.*</code>).</dd>
+<dt>3 days / 7 days</dt><dd>Default orphan-file age in Spark; minimum retention in Trino for orphan removal and snapshot expiry; StarRocks orphan default is also 7 days.</dd>
+<dt>75% / 180% / 5</dt><dd>Spark compaction candidates: files under 75% or over 180% of target size, or groups of 5 or more files.</dd>
+<dt>100 GB, 5 groups</dt><dd>Maximum bytes per compaction file group; file groups rewritten at once. Partial progress is off by default.</dd>
+<dt>0.3</dt><dd>Delete ratio at which Spark compaction rewrites a file.</dd>
+<dt>100 MB / 1 GB</dt><dd>Trino <code>optimize</code> default size threshold; Trino default maximum written file size.</dd>
+<dt>256 MB</dt><dd>StarRocks <code>rewrite_data_files</code> default <code>min_file_size_bytes</code>.</dd>
+<dt>100 manifests, 8 MB</dt><dd>Automatic manifest merge trigger and target size.</dd>
+<dt>100, false</dt><dd>Previous metadata files tracked; delete-after-commit default.</dd>
+<dt>30 s</dt><dd>Spark Iceberg catalog cache: an entry expires after 30 s without access, so a session that keeps querying a table can see an old snapshot for longer, until a refresh.</dd>
+<dt>168 h, 5, 72 h</dt><dd>SeaweedFS maintenance worker defaults: snapshot retention, snapshots kept, orphan age.</dd>
+<dt>8,640</dt><dd>Commits per day at one every 10 seconds (arithmetic); 1,440 at one a minute.</dd>
+</dl>
+<aside class="box say"><b class="lbl">Say this</b><p>"I haven't operated Iceberg myself, so I'll describe what I'd put in place and watch. Iceberg tables need four routine jobs: compaction to fix small files and fold in deletes, snapshot expiry to free storage and keep metadata small, orphan cleanup with a long safety window, and manifest rewrites when planning slows. On a self-hosted stack nothing does this automatically, and engines differ: Spark has the full set, Trino has optimize, expire and orphan removal with seven-day minimums, StarRocks and Doris have recent procedures, and PyIceberg can only expire snapshots. I'd schedule them in Prefect per table class, after the last load, with a concurrency limit shared with ingestion so they never fight over the same partitions. I'd alert on progress metrics from the metadata tables, such as average file size, snapshot count and delete files per partition. And I'd settle retention with compliance, using tags for month-end states, because time travel is only a few days of safety net."</p></aside>
+</section>
+<section class="topic" id="catalogs"><h2>Iceberg catalogs</h2>
+<p class="lede">A catalog is the small service that turns a table name into the table's current state and makes every commit atomic. Every engine, pipeline and AI agent on-prem would pass through it, so it is also where namespaces, permissions, storage credentials and audit records live. It holds very little data, yet it is one of the few lake decisions that is hard to reverse, so it deserves a deliberate choice.</p>
+
+<h3>What a catalog does</h3>
+<p>In Iceberg terms a <dfn>catalog</dfn> is any component that can answer "where is the current metadata file of <code>risk.positions_eod</code>?" and can change that answer atomically. Production catalogs do six jobs.</p>
+<ol>
+<li><b>Name to pointer.</b> It maps <code>namespace.table</code> to the location of the current <code>metadata.json</code>. A <dfn>namespace</dfn> is a folder-like grouping of tables, for example <code>markets</code>, <code>risk</code>, <code>credit</code>, <code>mf</code> and <code>infra</code> for the data domains.</li>
+<li><b>Atomic commits.</b> It performs the compare-and-swap that makes a commit visible, so it is the one place where concurrent writers to a table are serialized.</li>
+<li><b>Lifecycle.</b> It creates, drops and renames tables, views and namespaces, and can register an existing metadata file as a table (<code>register_table</code>) or, since Iceberg 1.12, unregister one through the REST API without deleting its files.</li>
+<li><b>Authentication and authorization.</b> It decides who is calling (usually an OAuth2 or OpenID Connect (OIDC) token from an identity provider) and what they may do on which catalog, namespace, table or view.</li>
+<li><b>Credential vending.</b> Instead of giving every engine a long-lived object-store key for the whole bucket, the catalog can hand out short-lived credentials scoped to one table's location (<dfn>vended credentials</dfn>, usually minted through the store's Security Token Service (STS) API) or sign each storage request itself (<dfn>remote signing</dfn>).</li>
+<li><b>Audit.</b> It can record who loaded, created, committed to or granted access on which table and when; some catalogs also accept the scan metrics engines report.</li>
+</ol>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>A catalog sees table loads and commits, never the query. It knows that a principal loaded <code>mf.investor_holdings</code> and received read credentials; it does not know which rows or columns were read. Row filters and column masks must be enforced by a query engine.</li>
+<li>The catalog is on the commit path, not the data path. If it is down, no commits and no new table loads happen; queries already planned keep reading files, and engines with cached metadata may serve stale reads for a short while.</li>
+<li>Engines cache catalog answers. Spark's Iceberg catalog caches each loaded table and, by default, drops an entry only after 30 seconds without access (<code>cache.expiration-interval-ms</code>). A session that queries a table more often than that can keep reading the snapshot it first loaded and miss other writers' commits until it runs <code>REFRESH TABLE</code> or the entry goes idle. Dashboards that must reflect the EOD load immediately need a refresh, a shorter expiry or the cache turned off.</li>
+<li>Vended credentials depend on the object store offering an STS API. The Polaris docs, for example, describe a <code>stsUnavailable</code> flag for S3-compatible stores without STS (such as a Ceph RGW deployment with STS not enabled): vending is skipped and clients authenticate to the store directly. Lakekeeper, when a client sends no delegation header or accepts both methods, tries vending first and falls back to remote signing when vending is not enabled for the storage profile. Test this with the real store early.</li>
+</ul></aside>
+<p class="src">Sources: <a href="https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml">REST catalog OpenAPI</a> · <a href="https://iceberg.apache.org/docs/latest/spark-configuration/">Iceberg Spark configuration</a> · <a href="https://github.com/apache/iceberg/blob/apache-iceberg-1.12.0/core/src/main/java/org/apache/iceberg/CatalogProperties.java">Iceberg CatalogProperties (cache expiry semantics)</a> · <a href="https://polaris.apache.org/releases/1.8.0/configuration/configuring-polaris-for-production/configuring-aws-s3-cloud-storage-specific/">Polaris 1.8.0 S3 storage configuration</a> · <a href="https://docs.lakekeeper.io/docs/nightly/storage/">Lakekeeper storage</a></p>
+
+<h3>Catalog types</h3>
+<p>Iceberg clients support several catalog types. They differ in where the pointer lives and how the swap is made atomic.</p>
+<div class="tw"><table><thead><tr><th>Type</th><th>Where the pointer lives</th><th>How a commit is made atomic</th><th>Strengths</th><th>Weaknesses</th></tr></thead><tbody>
+<tr><td>Hive Metastore (HMS)</td><td>A table parameter in the metastore's relational database</td><td>Metastore lock, then update the parameter</td><td>Oldest and most widely supported; since Hive 4.1.0 HMS can also serve Iceberg REST endpoints</td><td>Thrift API and Hadoop-era operations; coarse authorization; no credential vending through Thrift</td></tr>
+<tr><td>JDBC / SQL</td><td>A row in a table in Postgres, MySQL or SQLite</td><td>Conditional <code>UPDATE ... WHERE metadata_location = old</code></td><td>No extra service; easy to understand</td><td>Every engine needs database credentials; authorization is only database-level; no credential vending; uneven engine support (Doris's is experimental since 4.1.0)</td></tr>
+<tr><td>REST</td><td>Whatever the server uses, usually Postgres</td><td>Server-side, from the client's stated requirements</td><td>Engine-neutral protocol; central authorization, vending and audit</td><td>One more service to run; implementations differ in features</td></tr>
+<tr><td>AWS Glue</td><td>A Glue table parameter</td><td>Glue's version-ID optimistic locking</td><td>Fully managed on AWS; Glue and S3 Tables also offer Iceberg REST endpoints</td><td>AWS only; not an option for an on-prem lake</td></tr>
+<tr><td>Nessie</td><td>Nessie's version store (Postgres through JDBC in production)</td><td>A commit on a branch that names the expected previous state</td><td>Git-like branches and tags spanning many tables; commits across tables</td><td>Extra concepts for every user; engines increasingly reach it through its Iceberg REST API</td></tr>
+<tr><td>Hadoop (file-system)</td><td>A version file in the warehouse</td><td>Atomic file rename</td><td>No service at all</td><td>Object stores have no atomic rename, so concurrent commits are unsafe; the spec marks the scheme deprecated; avoid on S3-compatible storage</td></tr>
+</tbody></table></div>
+<p class="src">Sources: <a href="https://iceberg.apache.org/spec/">Iceberg spec</a> · <a href="https://iceberg.apache.org/docs/latest/aws/">Iceberg AWS integration</a> · <a href="https://hive.apache.org/docs/latest/admin/iceberg-rest-catalog/">Hive Metastore Iceberg REST</a> · <a href="https://issues.apache.org/jira/browse/HIVE-28059">HIVE-28059 (fix version 4.1.0)</a> · <a href="https://projectnessie.org/guides/introduction/">Nessie introduction</a></p>
+
+<h3>The REST catalog spec</h3>
+<p>The <dfn>REST catalog spec</dfn> is an OpenAPI document in the Iceberg repository (<code>open-api/rest-catalog-open-api.yaml</code>) that defines HTTP endpoints for everything a catalog does. Any server that implements it works with any client that speaks it, much as any S3-compatible store works with any S3 client.</p>
+<div class="tw"><table><thead><tr><th>Endpoint (under <code>/v1/</code>)</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>config</code></td><td>Client bootstrap: defaults, overrides and the URL prefix for a warehouse</td></tr>
+<tr><td><code>{prefix}/namespaces</code></td><td>List, create, drop namespaces and set their properties</td></tr>
+<tr><td><code>{prefix}/namespaces/{ns}/tables/{table}</code></td><td>Load a table (returns metadata, plus storage config or credentials); POST to commit</td></tr>
+<tr><td><code>.../register</code>, <code>.../unregister</code></td><td>Adopt an existing metadata file as a table; remove a table from the catalog without deleting files</td></tr>
+<tr><td><code>.../tables/{table}/credentials</code></td><td>Fetch vended credentials for a table</td></tr>
+<tr><td><code>.../tables/{table}/plan</code></td><td>Server-side scan planning: the server walks the metadata tree and returns file tasks</td></tr>
+<tr><td><code>.../tables/{table}/metrics</code></td><td>Clients report scan and commit metrics</td></tr>
+<tr><td><code>{prefix}/transactions/commit</code></td><td>Atomic commit across several tables</td></tr>
+<tr><td><code>.../views</code></td><td>Iceberg views</td></tr>
+</tbody></table></div>
+<p>A commit is a list of <dfn>requirements</dfn> (assertions the server checks first) and <dfn>updates</dfn> (changes to apply). Abbreviated:</p>
+<pre><code class="lang-text">POST /v1/{prefix}/namespaces/risk/tables/positions_eod
+Idempotency-Key: 017f22e2-79b0-7cc3-98c4-dc0c0c07398f
+{
+  "requirements": [
+    {"type": "assert-table-uuid", "uuid": "9c12..."},
+    {"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": 41}
+  ],
+  "updates": [
+    {"action": "add-snapshot", "snapshot": {"snapshot-id": 42, "parent-snapshot-id": 41, "...": "..."}},
+    {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": 42}
+  ]
+}</code></pre>
+<p>The responses that matter operationally: 409 means a requirement failed (another writer moved the table) and the client may retry; 500, 502 and 504 are defined as <code>CommitStateUnknown</code>, meaning the commit may or may not have been applied; a server must answer 400 if it receives a requirement or update type it does not know. Clients opt into credential delegation with the header <code>X-Iceberg-Access-Delegation: vended-credentials</code> or <code>remote-signing</code> (the server may supply either, or neither), and can send an optional <code>Idempotency-Key</code> so that a server which supports it does not apply a retried request twice.</p>
+<p>Why this decouples engines from catalogs: before REST, each engine needed its own client for each catalog (Thrift for HMS, the AWS SDK for Glue, a JDBC driver, a Nessie client), and the commit logic ran inside every engine. With REST the engine needs one client and a URL; commit checks, authorization and credential handling move to the server. The team can change catalog implementation later by re-registering tables, without touching engine code beyond a URI and credentials.</p>
+<pre class="mermaid">flowchart LR
+  SR["StarRocks or Doris"] --> API["Iceberg REST API"]
+  TR["Trino or Spark"] --> API
+  PY["PyIceberg and DuckDB jobs"] --> API
+  AG["Agent gateway"] --> SR
+  API --> CS["Catalog server replicas"]
+  CS --> PG["Postgres primary and standby"]
+  CS -.->|"vended or signed access"| OS["Object store buckets"]
+  SR --> OS
+  TR --> OS
+  PY --> OS</pre>
+<p class="src">Sources: <a href="https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml">REST catalog OpenAPI</a> · <a href="https://iceberg.apache.org/rest-catalog-spec/">REST catalog spec page</a> · <a href="https://github.com/apache/iceberg/releases">Iceberg releases</a></p>
+
+<h3>Implementations as of Oct 2026</h3>
+<div class="tw"><table><thead><tr><th>Catalog</th><th>Version (Oct 2026)</th><th>Language</th><th>Persistence</th><th>Authorization model</th><th>Notes and maturity</th></tr></thead><tbody>
+<tr><td>Apache Polaris</td><td>1.8.0 (28 Sep 2026)</td><td>Java</td><td>Postgres through JDBC, or MongoDB</td><td>Role-based access control (RBAC): privileges granted to catalog roles, catalog roles to principal roles, principal roles to principals; optional external policy decision point such as Open Policy Agent (OPA)</td><td>Apache top-level project since Feb 2026. <code>TABLE_READ_DATA</code> and <code>TABLE_WRITE_DATA</code> are the privileges that yield short-lived storage credentials. Docs cover Ceph and RustFS storage, federation to other catalogs, a catalog migrator and an MCP server among its tools. Images <code>apache/polaris</code>.</td></tr>
+<tr><td>Lakekeeper</td><td>v0.14.0 (7 Oct 2026)</td><td>Rust</td><td>Postgres (the only supported backend)</td><td>Optional OpenFGA for fine-grained, hierarchical permissions; OIDC authentication</td><td>Separate management API; vends STS credentials where the store offers them and the storage profile enables it, otherwise remote signing. Its examples moved from MinIO to SeaweedFS in v0.13. Pre-1.0 versioning.</td></tr>
+<tr><td>Project Nessie</td><td>0.109.0 (8 Oct 2026)</td><td>Java</td><td>Version store: JDBC (Postgres listed as production), RocksDB (single node), MongoDB and others</td><td>Rule-based authorization: Common Expression Language (CEL) rules in the server configuration, matched on operation, role, reference and path</td><td>Git-like branches, tags and commits spanning many tables; serves the Iceberg REST API</td></tr>
+<tr><td>Apache Gravitino</td><td>1.3.1 (30 Sep 2026)</td><td>Java</td><td>Entity store on H2 (default), MySQL or Postgres; its Iceberg REST service uses a Hive, JDBC or REST backend in production (memory by default)</td><td>Own roles, privileges and ownership; can push privileges down to Apache Ranger; Iceberg REST access control only when the service runs embedded in the Gravitino server</td><td>Top-level since Jun 2025. Built for federating metadata across many sources; ships an Iceberg REST server.</td></tr>
+<tr><td>Unity Catalog OSS</td><td>0.7.0 (13 Oct 2026)</td><td>Java</td><td>H2 by default through Hibernate, configurable JDBC</td><td>Built-in privileges</td><td>Full Iceberg REST read and write in 0.7.0. Linux Foundation AI and Data sandbox project; strongest where Delta interoperability matters.</td></tr>
+<tr><td>Hive Metastore</td><td>4.2.1 (Aug 2026)</td><td>Java</td><td>Relational database (Postgres, MySQL and others)</td><td>Database- and table-level; Ranger in many deployments</td><td>Thrift API plus Iceberg REST endpoints when <code>metastore.catalog.servlet.port</code> is set; JWT authentication by default for REST</td></tr>
+<tr><td>SeaweedFS built-in</td><td>SeaweedFS v4.48 (28 Sep 2026)</td><td>Go</td><td>SeaweedFS's own metadata (filer)</td><td>SeaweedFS S3 identities and IAM policies; clients sign with AWS Signature Version 4 (SigV4), or exchange S3 keys for an OAuth2 token</td><td>One catalog per "table bucket", REST on port 8181, server-side maintenance (off by default). Simple, tied to one store, young.</td></tr>
+<tr><td>AWS S3 Tables and Glue Iceberg REST</td><td>Managed</td><td>n/a</td><td>AWS</td><td>IAM</td><td>Reference point only; data would leave the premises</td></tr>
+</tbody></table></div>
+<p class="src">Sources: <a href="https://polaris.apache.org/releases/1.8.0/managing-security/access-control/">Polaris access control</a> · <a href="https://polaris.apache.org/releases/1.8.0/">Polaris 1.8.0 docs</a> · <a href="https://docs.lakekeeper.io/docs/latest/concepts/">Lakekeeper concepts</a> · <a href="https://projectnessie.org/">Project Nessie</a> · <a href="https://projectnessie.org/nessie-latest/authorization">Nessie authorization</a> · <a href="https://gravitino.apache.org/docs/next/iceberg-rest-service">Gravitino Iceberg REST service</a> · <a href="https://gravitino.apache.org/docs/next/security/access-control">Gravitino access control</a> · <a href="https://github.com/unitycatalog/unitycatalog">Unity Catalog OSS</a> · <a href="https://hive.apache.org/docs/latest/admin/iceberg-rest-catalog/">HMS Iceberg REST</a> · <a href="https://github.com/seaweedfs/seaweedfs/wiki/S3-Table-Bucket">SeaweedFS table buckets</a> · <a href="https://github.com/seaweedfs/seaweedfs/wiki/SeaweedFS-Iceberg-Catalog">SeaweedFS Iceberg catalog</a></p>
+
+<h3>Which engines can read and write Iceberg</h3>
+<div class="tw"><table><thead><tr><th>Engine (Oct 2026)</th><th>Catalog types</th><th>Read</th><th>Write</th><th>Row-level changes</th><th>Maintenance</th></tr></thead><tbody>
+<tr><td>StarRocks 4.1.6</td><td>Hive Metastore, Glue, REST and others</td><td>Yes</td><td>INSERT and INSERT OVERWRITE since 3.1 (Parquet only); hidden-partition writes since 4.0</td><td>DELETE via position delete files since 4.1</td><td>Compaction API since 4.0; procedures via <code>ALTER TABLE ... EXECUTE</code></td></tr>
+<tr><td>Doris 4.1.4.1</td><td>hms, rest, hadoop, glue, dlf, jdbc, s3tables</td><td>Yes; deletion vectors since 4.1.0</td><td>INSERT, INSERT OVERWRITE</td><td>UPDATE, DELETE, MERGE INTO (experimental since 4.1.0)</td><td><code>rewrite_data_files</code> 4.0.2+; expire and manifest rewrite 4.1.0+</td></tr>
+<tr><td>ClickHouse 26.9</td><td>DataLakeCatalog for REST, Glue, Unity, Lakekeeper, Nessie (mostly beta, read-only)</td><td>v1 and v2; v3 partial</td><td>INSERT beta from 26.2 with <code>allow_insert_into_iceberg=1</code>; CREATE experimental</td><td>DELETE experimental; UPDATE and MERGE unsupported</td><td>None</td></tr>
+<tr><td>Trino 483</td><td>hive_metastore, glue, jdbc, rest, nessie, snowflake</td><td>Yes; v3 experimental</td><td>INSERT, CREATE TABLE AS</td><td>UPDATE, DELETE, MERGE on v2</td><td>optimize, optimize_manifests, expire_snapshots, remove_orphan_files</td></tr>
+<tr><td>Spark with Iceberg 1.12</td><td>All Java catalog types including REST</td><td>Yes</td><td>All</td><td>Copy-on-write and merge-on-read</td><td>Full procedure set</td></tr>
+<tr><td>DuckDB iceberg extension</td><td>REST for writes</td><td>Yes</td><td>Only through an attached REST catalog, since 1.4.0</td><td>UPDATE and DELETE since 1.4.2; merge-on-read only, unsorted tables only</td><td>None</td></tr>
+<tr><td>PyIceberg 0.12.0</td><td>REST, SQL, Glue, Hive, DynamoDB, BigQuery metastore, in-memory</td><td>Yes</td><td>append, overwrite with filter, dynamic_partition_overwrite, upsert, add_files</td><td>delete (rewrites affected files)</td><td>expire_snapshots only</td></tr>
+</tbody></table></div>
+<aside class="box asof"><b class="lbl">As of Oct 2026</b><p>Release facts in this section: StarRocks 4.1.6 (30 Sep 2026), Doris 4.1.4.1 (29 Sep 2026), ClickHouse v26.9 stable and v26.8 LTS (13 Oct 2026), Trino 483 (17 Jul 2026), Iceberg 1.12.0 (30 Sep 2026), PyIceberg 0.12.0 (1 Sep 2026). Write support outside Spark is moving fast; re-check each engine's Iceberg page before the POC, and treat anything marked beta or experimental as read-only for production tables.</p></aside>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>"Supports Iceberg" hides big differences. In Oct 2026 ClickHouse is a solid reader and an early writer; Trino and Spark are full writers on v2; StarRocks and Doris write and are adding maintenance release by release; DuckDB and PyIceberg suit jobs and notebooks.</li>
+<li>The catalog choice must work for the weakest engine you need. A catalog feature that only some engines understand is partly invisible to the others. Nessie branches are an example: Spark can switch branches in SQL, while Trino reads one branch or tag fixed per catalog in its configuration (<code>iceberg.nessie-catalog.ref</code>, default <code>main</code>).</li>
+<li>Name engines' catalog connections the same everywhere (<code>lake</code>) so SQL and dbt models move between engines without edits.</li>
+</ul></aside>
+<p class="src">Sources: <a href="https://docs.starrocks.io/docs/introduction/Architecture/">StarRocks docs</a> · <a href="https://doris.apache.org/docs/dev/lakehouse/catalogs/iceberg-catalog">Doris Iceberg catalog</a> · <a href="https://clickhouse.com/docs/use-cases/data-lake/support-matrix">ClickHouse data lake support matrix</a> · <a href="https://trino.io/docs/current/connector/iceberg.html">Trino Iceberg connector</a> · <a href="https://duckdb.org/docs/current/core_extensions/iceberg/writing_to_iceberg.html">DuckDB Iceberg writes</a> · <a href="https://py.iceberg.apache.org/api/">PyIceberg API</a> · <a href="https://trino.io/docs/current/object-storage/metastores.html">Trino metastores (Nessie ref)</a></p>
+
+<h3>Choosing a catalog</h3>
+<p>The requirements from the brief: self-hosted, no vendor lock-in, several engines (an MPP database plus Python and probably Spark or Trino), compliance and audit, and later AI agents with governed access. My recommendation, which a POC should confirm:</p>
+<ul>
+<li><b>Use the REST protocol.</b> It is the only option that keeps engines and catalog independent and puts authorization, credential handling and audit in one place.</li>
+<li><b>Short-list Apache Polaris and Lakekeeper</b>, both persisted on a highly available Postgres the team already knows how to run. Polaris brings Apache governance and a conventional RBAC model; Lakekeeper brings OpenFGA's fine-grained, hierarchical permissions and a remote-signing fallback for stores without STS.</li>
+<li><b>Keep the alternatives for specific needs.</b> Nessie if atomic publication across many tables is a hard requirement; Gravitino if federating metadata from many non-Iceberg sources matters more; SeaweedFS's built-in catalog for a quick POC if SeaweedFS is the store, accepting that it couples catalog and storage; HMS only for Hive compatibility.</li>
+</ul>
+<div class="tw"><table><thead><tr><th>POC criterion</th><th>How to test it</th></tr></thead><tbody>
+<tr><td>Engine compatibility</td><td>Create a table from one engine, write from the chosen MPP engine and PyIceberg, read from Trino or Spark and DuckDB; force two concurrent writers and confirm one retries cleanly</td></tr>
+<tr><td>Credentials with the chosen store</td><td>Confirm whether the store offers STS; test vended credentials or remote signing from every engine; fall back to per-engine static keys only with narrow bucket policies</td></tr>
+<tr><td>Authorization model</td><td>Model three personas: an ingestion pipeline (write to bronze and silver), a quant (read silver and gold), an agent (read selected gold tables only); check grants at namespace and table level and integration with the identity provider over OIDC</td></tr>
+<tr><td>Audit</td><td>Confirm that loads, commits and grant changes are logged with the principal, and that the log can ship to OpenSearch</td></tr>
+<tr><td>High availability and recovery</td><td>Kill a catalog replica mid-commit; fail over Postgres; restore from backup and check pointers against the object store</td></tr>
+<tr><td>Operations</td><td>Upgrade path, Prometheus metrics, backup procedure, how tables migrate out (register in another catalog)</td></tr>
+</tbody></table></div>
+<h4>High availability</h4>
+<p>A reasonable default (my judgement): two or three stateless catalog replicas behind a load balancer; Postgres with a synchronous standby managed by a failover tool such as Patroni; continuous archiving of the write-ahead log (WAL) for point-in-time recovery to storage outside the lake. The catalog database is tiny, but losing it, or restoring it to an old point, changes what every table means.</p>
+<h4>AI agents</h4>
+<p>For internal AI agents, give each agent its own principal so every action is attributable, grant read-only roles on specific gold namespaces, and keep write privileges away from agents entirely. Prefer that agents query through the MPP engine, which can apply row filters and column masks and keeps a query log, over receiving vended file credentials, because file-level access exposes every column in those files. Audit is then a join of catalog events and engine query logs on the agent's identity.</p>
+<pre class="mermaid">flowchart LR
+  A["Agent with its own identity"] --> G["Agent gateway"]
+  G --> E["MPP engine with row and column policies"]
+  E --> C["REST catalog with RBAC and audit"]
+  C --> P["Postgres"]
+  E --> O["Object store"]
+  E --> L["Query log"]
+  C --> AU["Catalog audit log"]
+  L --> S["OpenSearch audit view"]
+  AU --> S</pre>
+<p class="src">Sources: <a href="https://polaris.apache.org/releases/1.8.0/managing-security/access-control/">Polaris access control</a> · <a href="https://docs.lakekeeper.io/docs/latest/concepts/">Lakekeeper concepts</a> · <a href="https://docs.lakekeeper.io/docs/nightly/storage/">Lakekeeper storage</a></p>
+
+<h3>Incidents teams often hit</h3>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> At 18:40 every EOD load fails with catalog errors (HTTP 503 or connection timeouts). Dashboards keep working for a few minutes, then new queries fail to load tables. <b>Diagnosis.</b> The catalog replicas are healthy, but the Postgres primary's disk is full: a replication slot left behind by a decommissioned standby has been retaining WAL for weeks. Without its database the catalog can neither read nor swap pointers, so the whole lake is read-mostly and write-nothing. <b>Fix.</b> Drop the stale slot, free space, confirm the standby, and replay the failed loads; idempotent loads make the replay safe. <b>Lesson.</b> The catalog database is tier-zero infrastructure. Monitor disk, replication lag, replication slots and connection pools, and design ingestion to buffer and retry when commits are refused.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> Trino shows positions up to 12 October while StarRocks shows 13 October for the same table. A week later Trino queries on that table fail with missing files. <b>Diagnosis.</b> During a migration the table was registered in the new REST catalog with <code>register_table</code>, pointing at the same metadata file, while the old Hive Metastore entry stayed. Writers moved to REST, so HMS's pointer froze at an old metadata file. Then snapshot expiry through REST deleted files that the stale HMS pointer still referenced. <b>Fix.</b> Choose one catalog of record, remove the table from the old catalog without purging data (a <code>DROP TABLE</code> with purge would delete the files), and point every engine at the catalog of record, or federate the old catalog read-only to it. <b>Lesson.</b> A table has exactly one catalog that accepts commits. Registering it in a second catalog creates a fork, and maintenance in one fork corrupts the other.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> After the catalog database is restored from the previous night's backup, the day's loads have vanished from every table, although their Parquet files are on the store. <b>Diagnosis.</b> The restore rolled each table's pointer back to the previous night's metadata file. The day's commits wrote metadata files that nothing points to any more. If orphan cleanup runs now with a short window, it will delete them. <b>Fix.</b> Freeze maintenance, find each table's newest metadata file under its <code>metadata/</code> prefix, check its lineage, and re-register it before allowing writes. Then add WAL archiving so a future recovery loses seconds of commits. <b>Lesson.</b> The catalog's recovery point must be close to zero, and orphan and expiry windows must be longer than the time it takes to recover the catalog.</p></aside>
+<aside class="box trap"><b class="lbl">Common mistake</b><p>Handing every engine, notebook and agent one object-store key with access to the whole bucket because the catalog's credential vending is fiddly to set up. That bypasses every permission the catalog defines, makes audit impossible, and turns a leaked notebook into a leak of the mutual fund's investor records. A close second: using a JDBC catalog straight from every engine because it is simplest, which spreads database credentials everywhere and leaves no place to enforce permissions.</p></aside>
+
+<h3>Putting it together</h3>
+<aside class="box senior"><b class="lbl">Senior lens</b><p>The catalog is the control plane of the lake, so choose the protocol first and the product second. Standardizing on Iceberg REST keeps the exit open: tables can be re-registered in another implementation, and engines only change a URL. Avoid implementation-specific features (non-main branches in Nessie, product-specific policy objects) unless a requirement needs them. Run the catalog on Postgres because the team can operate Postgres well, and spend the effort on recovery: synchronous replication, WAL archiving and a tested runbook for re-registering tables. For AI agents the catalog is necessary and insufficient: it gives identity, coarse grants and an audit trail, while row- and column-level control and query logging come from the engine in front of it. Finally, ownership: one team owns the catalog, the grant model and the onboarding scripts, and every new domain or agent goes through them.</p></aside>
+<dl class="nums">
+<dt>1</dt><dd>Catalog of record per table; a second registration is a fork.</dd>
+<dt>409</dt><dd>REST commit conflict: a requirement failed; safe to retry.</dd>
+<dt>500 / 502 / 504</dt><dd>REST <code>CommitStateUnknown</code>: check whether the commit landed before retrying.</dd>
+<dt>30 s</dt><dd>Spark Iceberg catalog cache: entries expire after 30 s without access; a table queried more often than that can stay stale until refreshed.</dd>
+<dt>8181</dt><dd>Default port of SeaweedFS's built-in Iceberg REST catalog (S3 on 8333).</dd>
+<dt>2 to 3 replicas</dt><dd>Stateless catalog servers behind a load balancer, plus a synchronous Postgres standby (my judgement).</dd>
+<dt>7 catalog types in Doris</dt><dd>hms, rest, hadoop, glue, dlf, jdbc, s3tables; Trino lists six, including nessie and snowflake.</dd>
+</dl>
+<aside class="box say"><b class="lbl">Say this</b><p>"I haven't run a self-hosted catalog in production; a managed catalog such as Glue is the familiar equivalent, so this is how I'd approach it. The catalog maps each table to its current metadata file and does the atomic swap that makes a commit visible, so it is the one place where writers are serialized and where identity, permissions, storage credentials and audit belong. I'd standardize on the Iceberg REST protocol because it decouples the engines from the catalog product: StarRocks or Doris, Trino or Spark, PyIceberg and DuckDB all speak it. For the product I'd short-list Apache Polaris and Lakekeeper on a highly available Postgres and decide in a POC against the chosen object store, mainly on credential vending, the permission model and recovery. For AI agents I'd give each agent its own identity with read-only grants, and route their queries through the MPP engine so row and column policies and query logs apply, because the catalog alone only governs at table level."</p></aside>
+</section>
+
+</main>
+</div>
+<footer class="foot">Study notes · facts checked against primary sources in October 2026; version-sensitive facts are dated. Treat rules of thumb as rules of thumb.</footer>
+<nav class="setnav" aria-label="Study set"><span class="lbl">Theory</span><span class="soon">Distributed DBs</span><span class="soon">MPP performance</span><span class="soon">Object storage</span><span class="soon">Compression &amp; encryption</span><span class="cur" aria-current="page">Iceberg &amp; catalogs</span><span class="soon">Design &amp; operate</span><span class="soon">Questions</span><span class="lbl" style="margin-left:.6rem">Hands-on</span><span class="soon">Lab (optional)</span></nav>
+</div>
+<script>
+(function () {
+  var main = document.querySelector('main'); var list = document.getElementById('toc-list');
+  if (!main || !list) return;
+  function slug(t) { return t.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60); }
+  var seen = {}; var links = [];
+  main.querySelectorAll('section.topic > h2, section.topic h3').forEach(function (h) {
+    var host = h.tagName === 'H2' ? h.parentElement : h;
+    var id = host.id || slug(h.textContent); while (seen[id]) id += '-x'; seen[id] = 1; host.id = id;
+    var li = document.createElement('li'); li.className = h.tagName.toLowerCase();
+    var a = document.createElement('a'); a.href = '#' + id; a.textContent = h.textContent; li.appendChild(a); list.appendChild(li);
+    links.push([host, a]);
+  });
+  var d = document.querySelector('.toc details');
+  if (d && window.matchMedia('(min-width: 64rem)').matches) d.open = true;
+  if ('IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function (es) {
+      es.forEach(function (e) { if (e.isIntersecting) { links.forEach(function (p) { p[1].classList.toggle('on', p[0] === e.target); }); } });
+    }, { rootMargin: '0px 0px -75% 0px' });
+    links.forEach(function (p) { io.observe(p[0]); });
+  }
+})();
+</script>
+</body>
+</html>

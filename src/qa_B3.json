@@ -1,0 +1,310 @@
+[
+ {
+  "id": "B3-01",
+  "topic": "iceberg-tables",
+  "q": "What is Apache Iceberg, and what problem does it solve compared with a Hive-style table on S3?",
+  "mid": "Iceberg is an open table format: it describes a table as immutable data files plus a tree of metadata files, and a catalog holds a pointer to the current metadata file. A Hive-style table is just a directory, so planning needs slow LIST calls, overwrites are not atomic, partition values live in paths, schema changes by name or position are unsafe, and concurrent writers race. Iceberg fixes these with snapshots, an atomic pointer swap on commit, hidden partitioning and field-ID based schema evolution.",
+  "senior": "The deeper point is that Iceberg is a protocol between engines, so StarRocks or Doris, Trino, Spark and PyIceberg can share one copy of the data on the self-hosted store. The price is that metadata becomes the thing to operate: small files, snapshot growth and delete files have to be maintained by jobs the team owns. I'd also stress that correctness depends on every writer honouring the protocol, so I'd give each table one owning writer.",
+  "followups": [
+   {
+    "q": "Why can't you just rename a temp directory into place on S3?",
+    "a": "Object stores have no directory rename; a rename is a copy plus delete per object, which is slow and can fail halfway, so it cannot be a commit."
+   },
+   {
+    "q": "What does a reader do instead of listing?",
+    "a": "It asks the catalog for the current metadata file, then reads the manifest list and manifests, which name every file with its partition values and column statistics."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B3-02",
+  "topic": "iceberg-tables",
+  "q": "Walk me through Iceberg's metadata tree and what happens when a query with a filter runs.",
+  "mid": "The catalog points to metadata.json, which holds schemas, partition specs, properties and the list of snapshots. Each snapshot points to a manifest list, which lists manifests with partition summaries; each manifest lists data and delete files with partition values and per-column min, max and null counts. A query reads metadata.json, skips manifests whose partition range cannot match, skips files whose column bounds cannot match, then range-reads only the needed row groups and columns.",
+  "senior": "Pruning quality depends on two separate things: partitioning decides which files are candidates, and the sort order decides how tight each file's column bounds are. Without a sort order a day's files all span the whole day, so a one-hour query reads them all. Planning usually runs on one node, so when queries are slow before reading data I'd look at manifest count, metadata file size and metadata caching, using the metadata tables such as $manifests and $files.",
+  "followups": [
+   {
+    "q": "What is in a manifest list versus a manifest?",
+    "a": "The manifest list has one row per manifest with partition bounds and counts; a manifest has one row per data or delete file with partition values, record count, size and column statistics."
+   },
+   {
+    "q": "Which columns get statistics by default?",
+    "a": "The first 100 columns, in truncate(16) mode; wide tables need explicit per-column metrics settings for the columns you filter on."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B3-03",
+  "topic": "catalogs",
+  "q": "What does an Iceberg catalog do, and which one would you pick for our on-prem lake?",
+  "mid": "The catalog maps a table name to its current metadata file and performs the atomic compare-and-swap that makes a commit visible. It also manages namespaces and, in a REST catalog, authentication, authorization, credential vending and audit. I'd use the Iceberg REST protocol and short-list Apache Polaris and Lakekeeper on a highly available Postgres.",
+  "senior": "I'd choose the protocol first and the product second, because REST keeps engines independent of the catalog and tables can be re-registered elsewhere later. The POC decides between products on three things: credential vending against the actual object store (STS or remote signing), the permission model for pipelines, humans and agents, and recovery behaviour. The catalog database is tiny but tier-zero, so it gets synchronous replication and WAL archiving.",
+  "followups": [
+   {
+    "q": "Why not just use a JDBC catalog?",
+    "a": "It works for a single team, but every engine needs database credentials, there is no central authorization or credential vending, and engine support is uneven; Doris's JDBC catalog is experimental since 4.1.0."
+   },
+   {
+    "q": "When would you pick Nessie?",
+    "a": "If atomic publication across many tables is a hard requirement, since Nessie commits can span tables on a branch; otherwise its extra concepts are a cost for every user."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B3-04",
+  "topic": "iceberg-tables",
+  "q": "How does Iceberg handle two jobs writing to the same table at the same time?",
+  "mid": "Iceberg uses optimistic concurrency: each writer writes its data and metadata files, then asks the catalog to swap the pointer only if it still points at the version it started from. If another writer committed first, the loser reloads, checks its assumptions, rebuilds only its manifest list and metadata file on top of the new state, and retries, 4 times by default. Two appends both succeed after a retry.",
+  "senior": "Row-level operations validate more: under the default serializable isolation a MERGE fails if new files matching its filter were added since it started, which protects corrections from silently missing late trades. Readers get snapshot isolation and never block. There are no multi-table transactions in core Iceberg; the REST spec has a transactions endpoint and Nessie supports multi-table commits. Operationally, conflicts are a scheduling problem: keep compaction off partitions that are still being corrected, and on HTTP 500, 502 or 504 check whether the commit landed before retrying.",
+  "followups": [
+   {
+    "q": "What does a 409 from a REST catalog mean?",
+    "a": "A commit requirement such as assert-ref-snapshot-id failed because another writer moved the table; the client may retry."
+   },
+   {
+    "q": "Serializable versus snapshot isolation for writes?",
+    "a": "Serializable rejects a row-level write if conflicting data was added in its scope; snapshot isolation only guards against conflicting deletes, so it allows write skew."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B3-05",
+  "topic": "iceberg-tables",
+  "q": "Why Iceberg rather than Delta Lake or Hudi for us?",
+  "mid": "All three put ACID tables on object storage. Delta keeps an ordered JSON log with checkpoints and is strongest in Spark; Hudi was built for upsert-heavy ingestion with merge-on-read tables and record-level indexes; Iceberg uses a metadata tree with hidden partitioning and has the broadest engine support on our shortlist. Iceberg also has an open REST catalog spec implemented by several independent catalogs.",
+  "senior": "For a self-hosted, multi-engine lake with a no-lock-in goal, engine breadth and an open catalog protocol decide it: StarRocks, Doris, Trino, Spark, DuckDB and PyIceberg all read and write Iceberg, and ClickHouse reads it. I'd pick Delta if Spark were the centre of the platform and Hudi if most data were high-rate upserts. I'd still verify in the POC that the chosen MPP engine's Iceberg writes are production-grade, since that varies by release.",
+  "followups": [
+   {
+    "q": "Does Delta have a catalog standard?",
+    "a": "Unity Catalog is the main one; Unity Catalog OSS 0.7.0 also serves the Iceberg REST API."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B3-06",
+  "topic": "iceberg-ops",
+  "q": "What maintenance does an Iceberg table need, and how would you run it on-prem?",
+  "mid": "Four routine jobs: compaction (rewrite data files) to fix small files and fold in deletes, snapshot expiry to free storage and keep metadata small, orphan file removal for files from failed writes, and manifest rewrites when planning slows. I'd also enable deletion of old metadata files after commit. On-prem nothing does this automatically, so I'd schedule them in Prefect per table after the last load.",
+  "senior": "Engines differ a lot in Oct 2026: Spark has the full procedure set, Trino has optimize, optimize_manifests, expire_snapshots and remove_orphan_files with 7-day minimum retention, StarRocks and Doris have recent ALTER TABLE EXECUTE procedures, PyIceberg can only expire snapshots, and SeaweedFS has server-side maintenance that is off by default. I'd pick one maintenance engine per table, share a Prefect concurrency limit with ingestion, and alert on progress metrics from metadata tables: average file size, snapshot count, delete files per partition.",
+  "followups": [
+   {
+    "q": "What are the expiry defaults?",
+    "a": "Snapshots older than 5 days are expired, keeping at least 1; branches and tags have their own retention and main never expires."
+   },
+   {
+    "q": "Why does compaction temporarily increase storage?",
+    "a": "The replaced small files stay until the snapshots that reference them are expired."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B3-07",
+  "topic": "iceberg-tables",
+  "q": "How would you partition F&O tick data in Iceberg?",
+  "mid": "I'd use hidden partitioning: day(ts) plus bucket(16, underlying), and a sort order of underlying, contract, ts inside files. Queries filter on ts and underlying and Iceberg derives the partition filters, so nobody needs a separate trade_date column. I would not partition by contract with identity, because thousands of contracts a day would create tiny files.",
+  "senior": "Partitioning picks candidate files and the sort order makes column bounds tight, so a one-hour NIFTY query reads a handful of files. My rule of thumb, from the 512 MB target size: a partition that gets less than one target-size file per load cycle is too fine. If volumes grow, partition evolution can move new data to hours(ts) without rewriting history, and compaction with an output spec can migrate recent data. Small tables such as daily NAV should not be partitioned at all.",
+  "followups": [
+   {
+    "q": "Does bucket pruning work for LIKE 'NIFTY%'?",
+    "a": "No, bucket transforms prune only equality and IN predicates."
+   },
+   {
+    "q": "Any engine syntax gotcha?",
+    "a": "Spark writes bucket(16, col) while Trino's partitioning property uses bucket(col, 16)."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B3-08",
+  "topic": "iceberg-tables",
+  "q": "Explain copy-on-write versus merge-on-read, and the kinds of delete files.",
+  "mid": "Copy-on-write rewrites every data file containing a changed row, so writes are expensive and reads are free; it is the Iceberg Java default. Merge-on-read writes a small delete record and readers merge it at query time until compaction folds it in. Deletes can be position deletes (file and row position, v2), equality deletes (match on column values, used by streaming upserts) or deletion vectors (a bitmap per data file in a Puffin file, v3).",
+  "senior": "I'd choose per table: append-only ticks need neither, daily-reloaded positions suit INSERT OVERWRITE, trade corrections suit merge-on-read with nightly compaction. Equality deletes are the expensive one to read, because each must be checked against every older file in its partition, or the whole table if unpartitioned; the v4 draft bans writing new ones. In v3, new position delete files are prohibited in favour of deletion vectors, but engine support for v3 is still uneven in Oct 2026.",
+  "followups": [
+   {
+    "q": "Which engines write which?",
+    "a": "Spark writes position deletes on v2 and DVs on v3; Trino writes position deletes on v2; StarRocks 4.1 DELETE uses position deletes; Doris 4.1 writes position deletes on v2 and DVs on v3; Flink upserts typically write equality deletes."
+   },
+   {
+    "q": "How do sequence numbers matter?",
+    "a": "A position delete applies to data files with sequence number less than or equal to its own; an equality delete only to strictly older files."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B3-09",
+  "topic": "catalogs",
+  "q": "What is the Iceberg REST catalog spec, and why does it matter?",
+  "mid": "It is an OpenAPI document in the Iceberg repository that defines HTTP endpoints for namespaces, tables, views, commits, credentials and more. Any client that speaks it works with any server that implements it. A commit sends requirements, such as the expected current snapshot, plus updates, and the server applies them atomically or returns 409.",
+  "senior": "It moves commit logic, authorization and credential handling out of every engine and into one service, so engines need one client and a URL. That makes the catalog product replaceable. Operational details I'd know: 500, 502 and 504 on commit mean CommitStateUnknown, an optional Idempotency-Key header lets a server that supports it apply a retried request only once, the X-Iceberg-Access-Delegation header requests vended credentials or remote signing, and newer endpoints add server-side scan planning, multi-table transactions and, from Iceberg 1.12, unregister.",
+  "followups": [
+   {
+    "q": "What does /v1/config do?",
+    "a": "It bootstraps the client with defaults, overrides and the URL prefix for the requested warehouse."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B3-10",
+  "topic": "iceberg-ops",
+  "q": "We want near-real-time tick ingestion into the lake. What goes wrong, and how would you design it?",
+  "mid": "Committing every few seconds creates thousands of snapshots and small files a day: at one commit every 10 seconds that is 8,640 commits. Metadata grows, commits slow down and planning reads more manifests. I'd buffer and commit once a minute or per load cycle, compact settled partitions nightly, and expire snapshots frequently.",
+  "senior": "Commit frequency is a design parameter with a compounding metadata cost. If dashboards need second-level freshness, I'd serve that from the MPP engine's native tables and land Iceberg in micro-batches. I'd also turn on write.metadata.delete-after-commit.enabled, rewrite manifests for fast-append writers such as PyIceberg, and watch metadata-table metrics. The numbers to commit to come from a POC on real NSE and MCX volumes.",
+  "followups": [
+   {
+    "q": "Why does PyIceberg make this worse?",
+    "a": "It fast-appends by default, adding a manifest per commit, and in 0.12 it cannot compact."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B3-11",
+  "topic": "catalogs",
+  "q": "Which engines on our shortlist can actually read and write Iceberg today?",
+  "mid": "As of Oct 2026: Spark is the full reference; Trino 483 reads and writes v2 with UPDATE, DELETE and MERGE and has maintenance procedures; StarRocks 4.1 writes with INSERT and INSERT OVERWRITE and DELETE via position deletes; Doris 4.1 writes including experimental UPDATE, DELETE and MERGE; ClickHouse reads v1 and v2 well but INSERT is beta and UPDATE and MERGE are unsupported. DuckDB writes only through a REST catalog, and PyIceberg writes append, overwrite, upsert and delete.",
+  "senior": "I'd treat anything beta or experimental as read-only for production tables and assign each table one production-grade writer. The catalog and format version must suit the weakest engine that writes: Trino calls v3 experimental with no row-level operations or OPTIMIZE, so I'd keep shared tables on v2. Before committing to ClickHouse as the MPP layer I'd check whether its Iceberg writes and catalog integration have left beta.",
+  "followups": [
+   {
+    "q": "Which catalog types does Doris support?",
+    "a": "hms, rest, hadoop, glue, dlf, jdbc and s3tables."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B3-12",
+  "topic": "catalogs",
+  "q": "How would you give AI agents governed access to lake data?",
+  "mid": "Each agent gets its own identity in the identity provider and a catalog principal with read-only roles on specific gold namespaces. No agent gets write privileges or a shared bucket key. Every access is logged with the agent's identity.",
+  "senior": "The catalog governs at table level and never sees the query, so for row filters, column masks and query logs I'd route agents through the MPP engine and keep vended file credentials away from them, because those expose every column in the files. Audit becomes a join of catalog events and engine query logs on the agent identity. Investor records for the mutual fund would sit in a restricted namespace with its own roles and keys.",
+  "followups": [
+   {
+    "q": "What does Polaris offer here?",
+    "a": "RBAC where TABLE_READ_DATA and TABLE_WRITE_DATA are the privileges that yield short-lived storage credentials, plus an optional external policy decision point such as OPA."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B3-13",
+  "topic": "iceberg-tables",
+  "q": "How do schema evolution and partition evolution work without rewriting data?",
+  "mid": "Every column has a permanent field ID stored in the Parquet files, and readers match by ID, so add, drop, rename, reorder and safe type widening are metadata-only commits. Partition evolution adds a new partition spec; old files keep their spec, new files use the new one, and the planner evaluates each manifest against its own spec.",
+  "senior": "Two traps: dropping and re-adding a column with the same name creates a new ID, so old values read as null; and dropping a column does not erase its bytes, which matters for personal data until files are rewritten and old snapshots expired. Type promotions are limited to int to long, float to double and wider decimal precision, with date to timestamp added in v3. Files without field IDs need a name mapping.",
+  "followups": [
+   {
+    "q": "How would you migrate old data to a new partition spec?",
+    "a": "Compaction with an output spec ID rewrites chosen partitions into the new layout."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B3-14",
+  "topic": "iceberg-tables",
+  "q": "How would you use snapshots, time travel, tags and branches for audit and data quality?",
+  "mid": "Time travel reads any retained snapshot by ID or timestamp, and rollback makes an earlier snapshot current. Tags name a snapshot with its own retention, for example a month-end NAV state. For write-audit-publish, the load writes to an audit branch, checks run on it, and main is fast-forwarded only if they pass.",
+  "senior": "Time travel is a window of days, 5 by default, so long-term reproducibility needs tags with retention set by compliance or an explicit bitemporal design. Raising routine retention to months instead inflates storage, because every replaced file is kept. WAP with branches has engine limits: Spark and Flink support branch writes, so the publish step should run where support is solid.",
+  "followups": [
+   {
+    "q": "What can publish_changes publish?",
+    "a": "Only append and dynamic-overwrite snapshots staged with a WAP ID."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B3-15",
+  "topic": "iceberg-ops",
+  "q": "What performance knobs would you look at on an Iceberg table?",
+  "mid": "Target file size (512 MB default), a sort order on the main filter columns, partition granularity, manifest merging and rewrites, metadata caching, column metrics for wide tables, Parquet bloom filters for high-cardinality equality lookups, and table statistics for joins.",
+  "senior": "The sort order is usually the biggest win because it makes min and max bounds prune. File size matters less for parallelism, since engines split by row group, but it matters for copy-on-write tables because each correction rewrites whole files. On wide loan tapes only the first 100 columns get statistics by default, so I'd name the filter columns. I'd measure each change with the engine's scan metrics before keeping it.",
+  "followups": [
+   {
+    "q": "What is Spark's default write distribution?",
+    "a": "Since Iceberg 1.2.0 Spark requests hash distribution by partition, which avoids many small files per task."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B3-16",
+  "topic": "catalogs",
+  "q": "What happens if the catalog goes down, or is restored from backup?",
+  "mid": "If the catalog or its database is down, no commits and no new table loads happen; queries already planned keep reading, and cached metadata may serve briefly. Ingestion must buffer and retry. I'd run two or three stateless replicas on a Postgres with a synchronous standby.",
+  "senior": "Restore is the dangerous case: restoring the catalog database to last night rolls every pointer back, and the day's commits become unreferenced metadata that orphan cleanup could delete. So the runbook freezes maintenance, re-registers each table's newest valid metadata file, and only then reopens writes. I'd keep the recovery point near zero with WAL archiving and keep orphan and expiry windows longer than catalog recovery time.",
+  "followups": [
+   {
+    "q": "What's a common Postgres-side cause of a catalog outage?",
+    "a": "A stale replication slot retaining WAL until the primary's disk fills."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B3-17",
+  "topic": "catalogs",
+  "q": "How does credential vending work, and will it work with an on-prem object store?",
+  "mid": "With vended credentials the catalog checks the caller's privileges and returns short-lived storage credentials scoped to the table's location, usually minted through the store's STS API. With remote signing the catalog signs each storage request instead. Clients request either with the X-Iceberg-Access-Delegation header.",
+  "senior": "On-prem it depends on the store: if it lacks STS, Polaris documents a flag that skips vending so clients use their own keys, while Lakekeeper falls back to remote signing. Engine support for each mode also varies, so I'd test every engine against the real store in the POC. Static per-engine keys are the fallback, with bucket policies limited to the prefixes each engine needs.",
+  "followups": [
+   {
+    "q": "Why bother, if engines are internal?",
+    "a": "It removes long-lived bucket-wide keys from every engine and notebook and makes access attributable per principal."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B3-18",
+  "topic": "iceberg-ops",
+  "q": "How would you bring CDC from the Postgres position system into Iceberg, and what's the risk?",
+  "mid": "A streaming upsert writer typically writes equality deletes keyed on the primary key plus new data files at each checkpoint. That keeps writes cheap. Readers must apply those deletes until compaction rewrites the files.",
+  "senior": "The risk is read amplification: each equality delete is checked against every older data file in its partition, and against the whole table if unpartitioned, so reads degrade daily without frequent compaction. I'd partition so deletes are scoped, compact with delete thresholds, and often serve current state from the MPP engine's primary-key table while Iceberg receives periodic snapshots. The v4 draft bans new equality deletes, a signal to avoid building on them.",
+  "followups": [
+   {
+    "q": "What finally removes equality deletes?",
+    "a": "Compaction that rewrites the affected data files, after which the delete files are dangling and can be dropped."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B3-19",
+  "topic": "iceberg-tables",
+  "q": "What does Iceberg format v3 add, and would you use it now?",
+  "mid": "v3 adds deletion vectors, row lineage, the variant type, column default values, nanosecond timestamps, geometry and geography, table encryption keys, multi-argument transforms and the unknown type. Specs v1 to v3 are complete and adopted; v4 is in development and not adopted.",
+  "senior": "I'd keep shared tables on v2 for now because engine support is uneven in Oct 2026: Trino calls v3 experimental with no row-level operations or OPTIMIZE, ClickHouse supports it partially, and Doris reads deletion vectors only since 4.1.0. v3 becomes worth it when every writer and reader in the POC handles it. Iceberg 1.11 also added built-in KMS envelope encryption, though encryption works only with Hive and REST catalogs and leaves metadata.json unencrypted.",
+  "followups": [
+   {
+    "q": "What is in v4?",
+    "a": "The draft spec already has relative paths, a content_stats struct that stores column statistics as typed values, and a ban on new equality deletes; adaptive metadata trees and single-file commits are still proposals outside the spec text."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B3-20",
+  "topic": "iceberg-ops",
+  "q": "What can go wrong with remove_orphan_files?",
+  "mid": "It deletes files under the table location that no metadata references and that are older than a threshold. A file being written by a job that has not committed yet looks exactly like an orphan, so a short threshold can delete live work. Spark defaults to 3 days and its SQL procedure refuses anything under 24 hours (the Java action API does not check); Trino enforces a 7-day minimum.",
+  "senior": "I'd wrap it so the window is never shorter than the longest job runtime or 3 days, run a dry run first, avoid running it during backfills, and keep it weekly. Path matching is by string, so scheme or authority mismatches such as s3a versus s3 can make everything look orphaned; Spark errors on mismatches by default and that setting should never be changed to delete. Bucket versioning gives a recovery path if it goes wrong.",
+  "followups": [
+   {
+    "q": "How do you recover if live files were deleted?",
+    "a": "Roll the table back to before the affected commit and rerun the job, or restore object versions if versioning is on."
+   }
+  ],
+  "level": "deep"
+ }
+]

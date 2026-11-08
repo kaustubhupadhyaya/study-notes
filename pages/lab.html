@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Lakehouse Lab</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,650&display=swap">
+<style>
+/* Layout: one reading column (~68ch) with a sticky contents rail on wide screens; field-guide boxes are
+   tinted panels led by a small label chip; numbers set in mono like an ops runbook. */
+:root {
+  --paper: #f3f5f7;
+  --surface: #ffffff;
+  --ink: #16202a;
+  --muted: #576474;
+  --line: #d6dde5;
+  --accent: #0d6a87;
+  --accent-soft: #e2eff4;
+  --code-bg: #edf1f5;
+  --say-bg: #e2eff4;   --say-fg: #0b546b;
+  --field-bg: #edf3e8; --field-fg: #3b6526;
+  --inc-bg: #fbebe9;   --inc-fg: #9a2b20;
+  --sen-bg: #eeecf8;   --sen-fg: #4a3e8e;
+  --trap-bg: #fbf2df;  --trap-fg: #855607;
+  --bri-bg: #e6f3ef;   --bri-fg: #1d6653;
+  --asof-bg: #edf0f3;  --asof-fg: #475262;
+  --font-display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --font-body: "Source Serif 4", Georgia, "Times New Roman", serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --step--1: 0.875rem; --step-0: 1.0625rem; --step-1: 1.25rem; --step-2: 1.55rem; --step-3: 2.1rem; --step-4: 2.7rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0e141a; --surface: #141c24; --ink: #e2e8ee; --muted: #9aa6b4; --line: #26313d;
+    --accent: #5bb8d6; --accent-soft: #15303b; --code-bg: #18222c;
+    --say-bg: #132c36;   --say-fg: #8fd0e6;
+    --field-bg: #18261a; --field-fg: #a6d58c;
+    --inc-bg: #2e1715;   --inc-fg: #f2a196;
+    --sen-bg: #1f1c33;   --sen-fg: #bdb3f2;
+    --trap-bg: #2c2312;  --trap-fg: #f0c26e;
+    --bri-bg: #13281f;   --bri-fg: #8fd9bf;
+    --asof-bg: #1a222b;  --asof-fg: #aab5c2;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0e141a; --surface: #141c24; --ink: #e2e8ee; --muted: #9aa6b4; --line: #26313d;
+  --accent: #5bb8d6; --accent-soft: #15303b; --code-bg: #18222c;
+  --say-bg: #132c36;   --say-fg: #8fd0e6;
+  --field-bg: #18261a; --field-fg: #a6d58c;
+  --inc-bg: #2e1715;   --inc-fg: #f2a196;
+  --sen-bg: #1f1c33;   --sen-fg: #bdb3f2;
+  --trap-bg: #2c2312;  --trap-fg: #f0c26e;
+  --bri-bg: #13281f;   --bri-fg: #8fd9bf;
+  --asof-bg: #1a222b;  --asof-fg: #aab5c2;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body { background: var(--paper); color: var(--ink); font-family: var(--font-body); font-size: var(--step-0);
+  line-height: 1.62; margin: 0; }
+.wrap { max-width: 76rem; margin: 0 auto; padding-inline: clamp(16px, 4vw, 40px); padding-block: 0 4rem; }
+a { color: var(--accent); text-underline-offset: 2px; }
+a:focus-visible, button:focus-visible, summary:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Set navigation */
+.setnav { display: flex; flex-wrap: wrap; gap: .35rem .5rem; align-items: center; padding-block: 1rem .75rem;
+  border-bottom: 1px solid var(--line); font-family: var(--font-display); font-size: var(--step--1); }
+.setnav .lbl { color: var(--muted); text-transform: uppercase; letter-spacing: .08em; font-size: .72rem; margin-right: .25rem; }
+.setnav a, .setnav span.cur { text-decoration: none; padding: .2rem .55rem; border-radius: 999px; border: 1px solid var(--line);
+  color: var(--ink); white-space: nowrap; }
+.setnav span.cur { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+.setnav a:hover { border-color: var(--accent); color: var(--accent); }
+.setnav .kind { color: var(--muted); font-size: .72rem; margin-left: .5rem; }
+
+/* Masthead */
+.mast { padding-block: 2.2rem 1.6rem; display: grid; gap: .6rem; max-width: 52rem; }
+.eyebrow { font-family: var(--font-mono); font-size: .78rem; letter-spacing: .06em; color: var(--accent); text-transform: uppercase; margin: 0; }
+h1 { font-family: var(--font-display); font-size: clamp(2rem, 5vw, var(--step-4)); line-height: 1.05; letter-spacing: -.02em;
+  margin: 0; font-weight: 700; text-wrap: balance; }
+.dek { font-size: var(--step-1); color: var(--muted); margin: 0; max-width: 46rem; }
+.meta { font-family: var(--font-mono); font-size: .78rem; color: var(--muted); margin: 0; display: flex; flex-wrap: wrap; gap: .3rem 1rem; }
+
+/* Layout */
+.layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 2.5rem; }
+@media (min-width: 64rem) { .layout { grid-template-columns: 15rem minmax(0, 1fr); } }
+.toc { font-family: var(--font-display); font-size: .88rem; }
+.toc details { border: 1px solid var(--line); border-radius: 8px; background: var(--surface); padding: .6rem .8rem; }
+.toc summary { cursor: pointer; font-weight: 600; }
+.toc ol { list-style: none; padding: 0; margin: .5rem 0 0; display: grid; gap: .15rem; }
+.toc li.h3 { padding-left: .9rem; font-size: .82rem; }
+.toc a { color: var(--muted); text-decoration: none; display: block; padding: .15rem .3rem; border-radius: 4px; }
+.toc a:hover, .toc a.on { color: var(--ink); background: var(--accent-soft); }
+@media (min-width: 64rem) {
+  .toc { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 1rem); align-self: start; max-height: calc(100vh - 2rem); overflow-y: auto; }
+  .toc details { border: 0; background: none; padding: 0; }
+}
+main { min-width: 0; }
+
+/* Content */
+section.topic { border-top: 2px solid var(--ink); padding-top: 1.2rem; margin-bottom: 3.5rem; }
+section.topic > h2 { font-family: var(--font-display); font-size: clamp(1.6rem, 3.6vw, var(--step-3)); line-height: 1.12;
+  letter-spacing: -.015em; margin: 0 0 .8rem; text-wrap: balance; }
+h3 { font-family: var(--font-display); font-size: var(--step-2); line-height: 1.2; margin: 2.4rem 0 .6rem; text-wrap: balance; }
+h4 { font-family: var(--font-display); font-size: var(--step-1); margin: 1.6rem 0 .4rem; }
+main p, main li { max-width: 68ch; }
+p.lede { font-size: var(--step-1); line-height: 1.5; color: var(--ink); max-width: 60ch; }
+dfn { font-style: normal; font-weight: 650; background: linear-gradient(transparent 62%, var(--accent-soft) 62%); }
+code { font-family: var(--font-mono); font-size: .86em; background: var(--code-bg); padding: .08em .3em; border-radius: 4px; }
+pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1rem; overflow-x: auto;
+  font-size: .85rem; line-height: 1.5; max-width: 100%; }
+pre code { background: none; padding: 0; font-size: inherit; }
+pre.mermaid { background: var(--surface); text-align: center; }
+.tw { overflow-x: auto; margin: 1.1rem 0; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: .92rem; line-height: 1.45; }
+th, td { text-align: left; vertical-align: top; padding: .55rem .7rem; border-bottom: 1px solid var(--line); }
+th { font-family: var(--font-display); font-size: .82rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); background: var(--paper); }
+tr:last-child td { border-bottom: 0; }
+td { font-variant-numeric: tabular-nums; }
+
+/* Boxes */
+aside.box { margin: 1.3rem 0; padding: .9rem 1.1rem 1rem; border-radius: 6px; max-width: 72ch; }
+aside.box > b.lbl { display: inline-block; font-family: var(--font-mono); font-size: .72rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .08em; padding: .12rem .5rem; border-radius: 3px; margin-bottom: .45rem; }
+aside.box p:last-child, aside.box ul:last-child { margin-bottom: 0; }
+aside.box ul { padding-left: 1.2rem; }
+aside.box p, aside.box li { max-width: none; }
+.say { background: var(--say-bg); } .say > .lbl { background: var(--say-fg); color: var(--say-bg); }
+.say p { font-size: 1.02rem; }
+.field { background: var(--field-bg); } .field > .lbl { background: var(--field-fg); color: var(--field-bg); }
+.incident { background: var(--inc-bg); } .incident > .lbl { background: var(--inc-fg); color: var(--inc-bg); }
+.incident b:not(.lbl) { color: var(--inc-fg); }
+.senior { background: var(--sen-bg); } .senior > .lbl { background: var(--sen-fg); color: var(--sen-bg); }
+.trap { background: var(--trap-bg); } .trap > .lbl { background: var(--trap-fg); color: var(--trap-bg); }
+.bridge { background: var(--bri-bg); } .bridge > .lbl { background: var(--bri-fg); color: var(--bri-bg); }
+.asof { background: var(--asof-bg); } .asof > .lbl { background: var(--asof-fg); color: var(--asof-bg); }
+.cite { font-family: var(--font-mono); font-size: .8em; color: var(--bri-fg); white-space: nowrap; }
+
+dl.nums { display: grid; grid-template-columns: minmax(6.5rem, max-content) minmax(0, 1fr); gap: .45rem 1rem; margin: 1.2rem 0;
+  padding: .9rem 1rem; border: 1px dashed var(--line); border-radius: 8px; background: var(--surface); max-width: 72ch; }
+dl.nums dt { font-family: var(--font-mono); font-weight: 600; color: var(--accent); font-variant-numeric: tabular-nums; }
+dl.nums dd { margin: 0; }
+p.src { font-family: var(--font-display); font-size: .8rem; color: var(--muted); }
+p.src a { color: var(--muted); }
+
+footer.foot { margin-top: 3rem; border-top: 1px solid var(--line); padding-top: 1rem; color: var(--muted); font-size: .88rem; }
+
+@media (max-width: 30rem) { dl.nums { grid-template-columns: minmax(0, 1fr); } dl.nums dd { margin-bottom: .4rem; } }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+html { scroll-behavior: smooth; }
+
+.setnav span.soon { padding: .2rem .55rem; border-radius: 999px; border: 1px dashed var(--line); color: var(--muted); white-space: nowrap; }
+.layout.single { grid-template-columns: minmax(0, 1fr); }
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav class="setnav" aria-label="Study set"><span class="lbl">Theory</span><span class="soon">Distributed DBs</span><span class="soon">MPP performance</span><span class="soon">Object storage</span><span class="soon">Compression &amp; encryption</span><span class="soon">Iceberg &amp; catalogs</span><span class="soon">Design &amp; operate</span><span class="soon">Questions</span><span class="lbl" style="margin-left:.6rem">Hands-on</span><span class="cur" aria-current="page">Lab (optional)</span></nav>
+<header class="mast">
+<p class="eyebrow">Study notes · hands-on (separate from theory)</p>
+<h1>Lakehouse Lab</h1>
+<p class="dek">A short optional hands-on run: object store, Iceberg catalog, a second engine and small files on one laptop.</p>
+<p class="meta"><span>10 min read · 30 s to run</span><span>verified end to end in October 2026</span><span>optional</span></p>
+</header>
+<div class="layout">
+<aside class="toc"><details><summary>On this page</summary><ol id="toc-list"></ol></details></aside>
+<main>
+<section class="topic" id="what"><h2>What this is</h2>
+<p class="lede">An optional, short hands-on run that shows the theory pages in action: an object store, an Iceberg table written through a REST catalog, a second engine reading the same table, and the small-files problem. It runs in about 30 seconds on a laptop, with no Docker. Reading the outputs below is enough if you don't run it.</p>
+<div class="tw"><table><thead><tr><th>Piece</th><th>Role in the lab</th><th>Where</th></tr></thead><tbody>
+<tr><td>SeaweedFS 4.48 <code>weed mini</code></td><td>S3-compatible object store (port 8333) and a built-in Iceberg REST catalog (port 8181)</td><td><code>D:\lakehouse-lab-data\bin\weed.exe</code></td></tr>
+<tr><td>PyIceberg 0.12, PyArrow 26, DuckDB 1.5.6</td><td>Writer, file inspector, and a second reading engine</td><td><code>D:\lakehouse-lab-data\.venv</code></td></tr>
+<tr><td><code>lab.py</code> and <code>README.md</code></td><td>The nine steps and how to start the store</td><td><code>$env:USERPROFILE\lakehouse-lab</code></td></tr>
+</tbody></table></div>
+<aside class="box asof"><b class="lbl">As of Oct 2026</b><p>The lab uses SeaweedFS because the MinIO community edition stopped shipping binaries in Oct 2025 and its repository was archived in 2026. SeaweedFS also ships an Iceberg REST catalog inside the same binary, which is why one program covers both the store and the catalog here.</p></aside>
+</section>
+
+<section class="topic" id="run"><h2>Run it (three commands)</h2>
+<pre><code class="lang-text"># 1. start the object store + Iceberg catalog (localhost only, lab-only credentials)
+cd D:\lakehouse-lab-data
+$env:AWS_ACCESS_KEY_ID="labadmin"; $env:AWS_SECRET_ACCESS_KEY="labadmin-local-only"; $env:S3_BUCKET="raw"
+Start-Process -WindowStyle Hidden .\bin\weed.exe -ArgumentList "mini","-dir=D:/lakehouse-lab-data/seaweed","-ip=127.0.0.1","-ip.bind=127.0.0.1","-tableBucket=lakehouse" -RedirectStandardOutput seaweed.log -RedirectStandardError seaweed.err
+
+# 2. run the nine steps
+cd $env:USERPROFILE\lakehouse-lab
+D:\lakehouse-lab-data\.venv\Scripts\python.exe -I lab.py
+
+# 3. stop the store
+Stop-Process -Name weed</code></pre>
+</section>
+
+<section class="topic" id="steps"><h2>The nine steps and what they showed</h2>
+<p class="lede">Real output from a verified run in October 2026. Timings will differ on another machine; the shapes won't.</p>
+
+<h3>1. Object storage is a flat key space</h3>
+<pre><code class="lang-text">keys under prefix broker_a/: ['broker_a/2026-10-13/trades.csv', 'broker_a/2026-10-14/trades.csv']
+range GET of the first 8 bytes: b'trade_id'</code></pre>
+<p>"Folders" are only key prefixes. A range GET reads part of an object, which is how engines read a Parquet footer without downloading the file. There is no rename and no append, which is why a table format needs a catalog to commit changes atomically.</p>
+
+<h3>2. Compression and sort order on 400,000 trades</h3>
+<pre><code class="lang-text">none, time order                  9.06 MB  ratio vs none  1.0x  write    394 ms  read    62 ms
+snappy, time order                6.17 MB  ratio vs none  1.5x  write    322 ms  read    63 ms
+lz4, time order                   6.15 MB  ratio vs none  1.5x  write    323 ms  read    52 ms
+zstd-3, time order                3.63 MB  ratio vs none  2.5x  write    300 ms  read    59 ms
+zstd-9, time order                3.56 MB  ratio vs none  2.5x  write    625 ms  read    77 ms
+zstd-3, shuffled                  5.35 MB  ratio vs none  1.7x  write    443 ms  read    70 ms
+zstd-3, sorted by symbol,ts       3.57 MB  ratio vs none  2.5x  write    342 ms  read    66 ms
+column 'ts' encodings: ('PLAIN', 'RLE', 'RLE_DICTIONARY'); min/max 09:15:00 .. 15:29:59 IST</code></pre>
+<p>ZSTD at level 3 gave a 2.5x smaller file than no compression for about the same read time. Level 9 bought almost nothing and doubled write time. Shuffling the same rows cost a third of the gain, because compression feeds on neighbouring values that look alike. The footer keeps min/max per column, which is what lets engines skip files.</p>
+
+<h3>3. Create an Iceberg table through a REST catalog</h3>
+<pre><code class="lang-text">table location: s3://lakehouse/market/trades
+current metadata file: s3://lakehouse/market/trades/metadata/v2.metadata.json</code></pre>
+<p>The table is partitioned by <code>day(ts)</code>, Iceberg's hidden partitioning: queries filter on <code>ts</code> and never mention a partition column.</p>
+
+<h3>4. Walk the metadata tree on object storage</h3>
+<pre><code class="lang-text">  1 x data file (.parquet)
+  1 x manifest (*.avro)
+  1 x manifest list (snap-*.avro)
+  2 x metadata.json
+data file example: 00000-0-c23aa43f-….parquet  rows=400000  size=4.26 MB</code></pre>
+<p>Catalog points to <code>metadata.json</code>, which points to a manifest list per snapshot, which lists manifests, which list data files with per-column stats. Two <code>metadata.json</code> files because create and append were two commits.</p>
+
+<h3>5. Snapshots and time travel</h3>
+<pre><code class="lang-text">snapshot 3775024942261689501  op=append     rows visible=400,000
+snapshot 3631631337377974667  op=append     rows visible=700,000
+snapshot 2575635864008417879  op=overwrite  rows visible=672,065</code></pre>
+<p>The delete of one symbol shows up as an <code>overwrite</code>: PyIceberg rewrote the affected file (copy-on-write). Every older snapshot stays readable until it is expired.</p>
+
+<h3>6. Schema evolution without rewriting data</h3>
+<pre><code class="lang-text">rows with venue NULL (old files untouched): 672,065; rows with venue NSE: 50,000</code></pre>
+<p>Iceberg tracks columns by field id, so adding <code>venue</code> touched only metadata. Old files read the new column as NULL.</p>
+
+<h3>7. Partition pruning from metadata alone</h3>
+<pre><code class="lang-text">files planned for the whole table: 3; for 14 Oct only: 1</code></pre>
+<p>The planner dropped two of three files using manifest statistics before opening any Parquet file.</p>
+
+<h3>8. A second engine reads the same table</h3>
+<pre><code class="lang-text">('NIFTY-FUT', 119671, 35084400)
+('BANKNIFTY-FUT', 60119, 17597275)
+('RELIANCE', 30224, 8763150)
+('TCS', 24119, 6967425)</code></pre>
+<p>PyIceberg wrote the table and DuckDB read it straight from object storage: no copy, no lock-in. The skew is visible too: NIFTY futures carry about 40% of the trades, which is exactly the kind of key you must not distribute an MPP table on.</p>
+
+<h3>9. The small-files problem, then snapshot expiry</h3>
+<pre><code class="lang-text">data files 3 -> 23; snapshots now 24; full scan 0.14s -> 0.27s
+snapshots after expire_snapshots(): 1</code></pre>
+<p>Twenty tiny "every-minute" appends added 4,000 rows (0.6% more data), twenty files and twenty snapshots, and nearly doubled the full-scan time. Compaction (Spark, Trino, StarRocks, or SeaweedFS's server-side compaction; PyIceberg can't compact yet) would merge them. Expiring snapshots keeps the metadata small.</p>
+</section>
+
+<section class="topic" id="extra"><h2>Optional: add a storage node without adding compute</h2>
+<pre><code class="lang-text">.\bin\weed.exe volume -dir=D:/lakehouse-lab-data/vol2 -mserver=127.0.0.1:9333 -ip=127.0.0.1 -ip.bind=127.0.0.1 -port=9341
+
+# master topology afterwards (http://127.0.0.1:9333/dir/status)
+volume servers: 2
+127.0.0.1:9340  volumes=3  max=531
+127.0.0.1:9341  volumes=0  max=8</code></pre>
+<p>The master registered a second volume server and new writes can land there. Nothing about the query side changed. That is independent scaling of storage, in miniature.</p>
+</section>
+
+</main>
+</div>
+<footer class="foot">Study notes · facts checked against primary sources in October 2026; version-sensitive facts are dated. Treat rules of thumb as rules of thumb.</footer>
+<nav class="setnav" aria-label="Study set"><span class="lbl">Theory</span><span class="soon">Distributed DBs</span><span class="soon">MPP performance</span><span class="soon">Object storage</span><span class="soon">Compression &amp; encryption</span><span class="soon">Iceberg &amp; catalogs</span><span class="soon">Design &amp; operate</span><span class="soon">Questions</span><span class="lbl" style="margin-left:.6rem">Hands-on</span><span class="cur" aria-current="page">Lab (optional)</span></nav>
+</div>
+<script>
+(function () {
+  var main = document.querySelector('main'); var list = document.getElementById('toc-list');
+  if (!main || !list) return;
+  function slug(t) { return t.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60); }
+  var seen = {}; var links = [];
+  main.querySelectorAll('section.topic > h2, section.topic h3').forEach(function (h) {
+    var host = h.tagName === 'H2' ? h.parentElement : h;
+    var id = host.id || slug(h.textContent); while (seen[id]) id += '-x'; seen[id] = 1; host.id = id;
+    var li = document.createElement('li'); li.className = h.tagName.toLowerCase();
+    var a = document.createElement('a'); a.href = '#' + id; a.textContent = h.textContent; li.appendChild(a); list.appendChild(li);
+    links.push([host, a]);
+  });
+  var d = document.querySelector('.toc details');
+  if (d && window.matchMedia('(min-width: 64rem)').matches) d.open = true;
+  if ('IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function (es) {
+      es.forEach(function (e) { if (e.isIntersecting) { links.forEach(function (p) { p[1].classList.toggle('on', p[0] === e.target); }); } });
+    }, { rootMargin: '0px 0px -75% 0px' });
+    links.forEach(function (p) { io.observe(p[0]); });
+  }
+})();
+</script>
+</body>
+</html>

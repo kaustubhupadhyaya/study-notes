@@ -1,0 +1,510 @@
+<section class="topic" id="object-storage"><h2>Object storage from scratch</h2>
+<p class="lede">Object storage is the layer that will hold almost every byte of the lake: tick files, Iceberg tables, loan-tape PDFs, model artefacts and backups. It is familiar as Amazon S3, where AWS runs it for you. On-prem, the team has to pick a product, size disks and failure domains, and own its failure modes, so this section builds the model from the API down to the disks.</p>
+
+<h3>The four nouns: bucket, key, object, metadata</h3>
+<p><dfn>Object storage</dfn> is a storage system that keeps whole blobs of bytes, each addressed by a name, behind an HTTP API. Four nouns describe it.</p>
+<ul>
+<li>A <dfn>bucket</dfn> is a named container. Most settings live at bucket level: access policy, versioning, lifecycle rules, replication and object lock. Example: <code>lake-bronze</code>.</li>
+<li>A <dfn>key</dfn> is the full name of one object inside a bucket. On AWS it can be up to 1,024 bytes. Example: <code>ticks/nse/dt=2026-10-13/symbol=RELIANCE/part-00001.parquet</code>.</li>
+<li>An <dfn>object</dfn> is the stored bytes for one key plus its metadata. On AWS a single object can be up to 48.8 TiB (as of Oct 2026).</li>
+<li><dfn>Metadata</dfn> is a set of name-value pairs stored with the object. System metadata includes size, last-modified time, content type and the <dfn>ETag</dfn>, an identifier of the content (for a simple single-part upload it is usually the MD5 hash of the bytes). User metadata is whatever you attach, for example <code>x-amz-meta-source=nse-bhavcopy</code>.</li>
+</ul>
+<p>The namespace is a <dfn>flat namespace</dfn>: there are no directories. The slash in <code>ticks/nse/dt=2026-10-13/</code> is an ordinary character in the key. A <dfn>prefix</dfn> is any leading part of a key, such as <code>ticks/nse/</code>. When you ask the store to list keys under a prefix and pass a <dfn>delimiter</dfn> (usually <code>/</code>), it groups keys by the next slash and returns "common prefixes". Consoles draw those as folders, which is why S3 feels like a filesystem until you try to rename one.</p>
+<p>Objects are <dfn>immutable</dfn>: once written, the bytes of an object never change in place. To change one byte of yesterday's RELIANCE tick file you write a whole new object, either under the same key (which replaces the old one) or under a new key. Almost every design choice in the rest of this group follows from that one property.</p>
+<p class="src">Sources: <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html">AWS S3 multipart limits</a></p>
+
+<h3>The verbs: PUT, GET, LIST, DELETE, multipart and range reads</h3>
+<p>The S3 API has a few dozen operations, and a data lake leans on about seven of them.</p>
+<div class="tw"><table><thead><tr><th>Operation</th><th>What it does</th><th>What matters in a lake</th></tr></thead><tbody>
+<tr><td>PUT</td><td>Writes a whole object. Replaces any object already at that key.</td><td>A reader never sees half a file: the PUT completes or it does not. Two writers that PUT the same key race, and the last one wins silently.</td></tr>
+<tr><td>GET</td><td>Reads an object. With a <code>Range</code> header it reads only a byte range.</td><td>Query engines rarely read whole Parquet files. They issue many small range GETs.</td></tr>
+<tr><td>HEAD</td><td>Returns metadata only (size, ETag, last-modified).</td><td>Engines call it to learn a file's size before reading its footer, unless table metadata already holds the size.</td></tr>
+<tr><td>LIST (ListObjectsV2)</td><td>Returns keys under a prefix in sorted order, up to 1,000 per page, with a continuation token for the next page.</td><td>Pages are sequential round trips. Listing 10 million keys means about 10,000 calls. Keep LIST out of query planning.</td></tr>
+<tr><td>DELETE / DeleteObjects</td><td>Removes one object, or up to 1,000 keys per batch call. With versioning on, it adds a delete marker instead.</td><td>Snapshot expiry and orphan cleanup are mostly batch deletes.</td></tr>
+<tr><td>COPY</td><td>Server-side copy from one key to another.</td><td>The only way to "rename" on a general-purpose bucket: copy, then delete. Time and I/O grow with the bytes copied.</td></tr>
+<tr><td>Multipart upload</td><td>Create, upload parts (in parallel), then Complete or Abort.</td><td>Needed for large files. Parts of an unfinished upload keep using space until someone aborts it.</td></tr>
+</tbody></table></div>
+<p>A <dfn>multipart upload</dfn> splits one large object into parts that upload in parallel and are stitched together by a final Complete call. AWS limits (as of Oct 2026): up to 10,000 parts, each part 5 MiB to 5 GiB (the last part can be smaller), and AWS suggests considering multipart once an object reaches 100 MB. Iceberg's own S3 client (S3FileIO) uploads parts progressively as each part fills, with a default part size of 32 MB. On-prem stores implement the same calls, though limits can differ, so read your product's docs.</p>
+<p>A <dfn>range GET</dfn> is a GET with a <code>Range: bytes=start-end</code> header. It is how columnar engines read. <dfn>Parquet</dfn> is the columnar file format of the lake. A Parquet file is split into <dfn>row groups</dfn> (horizontal slices of rows), and each row group holds one <dfn>column chunk</dfn> per column. The <dfn>footer</dfn> at the end of the file records where every column chunk starts plus min and max statistics per chunk. A query such as average last traded price for INFY on one day reads the footer with one range GET at the end of the file, skips row groups whose symbol statistics exclude INFY, then range-GETs only the price and symbol column chunks of the remaining row groups. Two columns out of forty is a small fraction of the bytes, but the request count stays roughly the same per file, which is why the number of files matters as much as their size.</p>
+<p>A <dfn>conditional write</dfn> is a PUT that succeeds only if a condition on the current object holds. AWS added <code>If-None-Match</code> (write only if the key does not exist, August 2024) and <code>If-Match</code> (write only if the ETag still matches, a compare-and-swap, November 2024). These let a writer build put-if-absent or compare-and-swap logic directly on the store. On-prem support varies by product and version, so test it before any design depends on it.</p>
+<pre><code class="lang-python">import boto3
+from botocore.config import Config
+from boto3.s3.transfer import TransferConfig
+
+# On-prem stores usually want path-style addressing; credentials come from the
+# environment or a secrets vault at runtime.
+s3 = boto3.client(
+    "s3",
+    endpoint_url="https://s3.lake.internal",
+    config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 10, "mode": "adaptive"}),
+)
+
+# Range GET: read only the last 64 KB of a Parquet file, where the footer lives.
+tail = s3.get_object(
+    Bucket="lake-silver",
+    Key="warehouse/markets/ticks_nse/data/dt=2026-10-13/00001-7f3a.parquet",
+    Range="bytes=-65536",
+)["Body"].read()
+
+# Multipart upload: 64 MB parts, 8 in flight.
+cfg = TransferConfig(multipart_threshold=100 * 1024**2,
+                     multipart_chunksize=64 * 1024**2,
+                     max_concurrency=8)
+s3.upload_file("nav_2026-10-13.parquet", "lake-gold",
+               "mf/nav/dt=2026-10-13/nav.parquet", Config=cfg)</code></pre>
+<p class="src">Sources: <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html">AWS multipart limits</a> · <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-guidelines.html">AWS performance guidelines</a> · <a href="https://aws.amazon.com/about-aws/whats-new/2024/08/amazon-s3-conditional-writes">S3 conditional writes (Aug 2024)</a> · <a href="https://aws.amazon.com/about-aws/whats-new/2024/11/amazon-s3-functionality-conditional-writes/">S3 If-Match (Nov 2024)</a> · <a href="https://iceberg.apache.org/docs/latest/aws/">Iceberg S3FileIO</a> · <a href="https://parquet.apache.org/docs/file-format/data-pages/encodings/">Parquet encodings</a></p>
+
+<h3>Consistency: what strong read-after-write buys you</h3>
+<p>A <dfn>consistency model</dfn> says what a reader is guaranteed to see after a write. Under <dfn>strong read-after-write consistency</dfn>, once a PUT (or overwrite, or DELETE) returns success, every later GET and LIST from any client reflects it. Under <dfn>eventual consistency</dfn>, other clients may see the old state for a while.</p>
+<p>AWS S3 has been strongly consistent for all requests since December 2020. Before that, a Spark job could LIST a prefix right after another job wrote to it and miss new files, and the Hadoop world built workarounds such as S3Guard, which tracked listings in a DynamoDB table. Old blog posts still describe those workarounds, so date-check anything you read.</p>
+<p>On-prem, the answer depends on the product and the topology:</p>
+<ul>
+<li>Ceph's object gateway (RGW) sits on RADOS, Ceph's strongly consistent object layer, so a single-site cluster gives read-after-write. Ceph multisite replicates between zones in the background, and its sync status reports shards that are "behind", so a reader at the second site can see older data.</li>
+<li>Garage exposes the trade-off as a setting: <code>consistency_mode</code> defaults to <code>consistent</code>, while <code>degraded</code> and <code>dangerous</code> lower quorums and give up read-after-write consistency.</li>
+<li>For any product, practitioners verify it under load: one client PUTs, another immediately GETs and LISTs, in a loop, while a node is being restarted.</li>
+</ul>
+<p>Strong consistency is a per-key guarantee. A Spark job that writes 300 files for one partition cannot make all 300 appear at the same instant, and a reader that lists the prefix halfway through sees some of them. Multi-file atomicity has to come from a layer above the store, which is the subject of the next subsection.</p>
+<p class="src">Sources: <a href="https://aws.amazon.com/s3/consistency/">AWS S3 consistency</a> · <a href="https://docs.ceph.com/en/latest/radosgw/multisite/">Ceph multisite</a> · <a href="https://garagehq.deuxfleurs.fr/documentation/reference-manual/configuration/">Garage configuration reference</a></p>
+
+<h3>No rename, no append: why table formats and catalogs exist</h3>
+<p>A <dfn>Hive-style table</dfn> is the older way to put a table on files: the table is a directory, each partition is a subdirectory such as <code>dt=2026-10-13/</code>, and the table's contents are whatever files are in those directories when a reader lists them. Writers commit by writing into a temporary directory and then renaming it into place.</p>
+<p>On HDFS that works, because a rename is one metadata operation on a single server and is atomic. On object storage a "directory rename" is a COPY plus DELETE for every object under the prefix. The Hadoop S3A documentation states that directory renames take time proportional to the number and size of files and can fail partway through, so a commit protocol cannot rely on them. Hadoop added special "S3A committers" to work around it.</p>
+<p>There is also no append on general-purpose S3 buckets. A stream of ticks cannot grow one file through the day; each micro-batch becomes a new object. That is where the small-file problem comes from.</p>
+<p>A <dfn>table format</dfn> solves both problems with metadata. <dfn>Apache Iceberg</dfn> is the table formon-prem is considering. Its layers, from the bottom:</p>
+<ul>
+<li>Data files: Parquet (or ORC or Avro), each written once under a unique name and never modified.</li>
+<li>A <dfn>manifest</dfn>: an Avro file listing data files with per-file statistics (partition values, row counts, column min and max).</li>
+<li>A <dfn>manifest list</dfn>: one per snapshot, listing the manifests that make up that version of the table.</li>
+<li>A <dfn>metadata file</dfn> (<code>metadata.json</code>): the schema, partition spec, properties and the list of snapshots. A <dfn>snapshot</dfn> is the complete state of the table at one commit.</li>
+</ul>
+<p>A <dfn>catalog</dfn> is the service that maps a table name such as <code>markets.ticks_nse</code> to the location of its current metadata file, and that swaps the pointer atomically on commit. A commit therefore writes only new objects (immutability is fine with that) and finishes with one atomic compare-and-swap of a pointer. Readers ask the catalog for the pointer, read the metadata tree, and get an exact file list without any LIST call.</p>
+<p>Concurrent writers use <dfn>optimistic concurrency</dfn>: each writer prepares its commit assuming nobody else committed, and the catalog rejects the swap if the table moved underneath it. In the Iceberg REST catalog spec, a commit carries requirements such as <code>assert-ref-snapshot-id</code>, and a failed requirement returns HTTP 409, after which the client may retry. Iceberg's Java default is four retries (<code>commit.retry.num-retries</code>).</p>
+<pre class="mermaid">flowchart LR
+  W["Writer such as Spark or StarRocks"] -->|"1 PUT new data files"| D["Parquet data files"]
+  W -->|"2 PUT manifests and manifest list"| M["Manifests"]
+  W -->|"3 PUT metadata v42"| J["metadata.json files"]
+  W -->|"4 swap pointer v41 to v42"| C["Catalog"]
+  R["Reader such as Trino"] -->|"a ask for current pointer"| C
+  R -->|"b read metadata and manifests"| J
+  R -->|"c range GET only listed files"| D</pre>
+<p>AWS has since added append (November 2024) and an atomic RenameObject call (June 2025), but only for S3 Express One Zone directory buckets. General-purpose buckets and the S3 APIs of on-prem stores do not offer them, and Iceberg's design assumes neither.</p>
+<p class="src">Sources: <a href="https://hadoop.apache.org/docs/stable/hadoop-aws/tools/hadoop-aws/index.html">Hadoop S3A docs</a> · <a href="https://iceberg.apache.org/spec/">Iceberg spec</a> · <a href="https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml">Iceberg REST catalog OpenAPI</a> · <a href="https://iceberg.apache.org/docs/latest/configuration/">Iceberg configuration</a> · <a href="https://aws.amazon.com/about-aws/whats-new/2024/11/amazon-s3-express-one-zone-append-data-object">S3 Express append</a> · <a href="https://aws.amazon.com/about-aws/whats-new/2025/06/amazon-s3-express-one-zone-atomic-renaming-objects-api">S3 Express rename</a></p>
+
+<h3>Object, block, file and HDFS</h3>
+<p><dfn>Block storage</dfn> presents raw fixed-size blocks as a disk device: AWS EBS, a SAN volume, or Ceph RBD. Usually one host mounts it, and a filesystem or database sits on top. <dfn>File storage</dfn> is a shared filesystem with directories, rename, append and locks that many hosts mount at once: AWS EFS, an NFS server, CephFS. <dfn>HDFS</dfn> (Hadoop Distributed File System) is the Hadoop-era distributed filesystem: a <dfn>NameNode</dfn> holds the whole directory tree in memory, and <dfn>DataNodes</dfn> store files as large blocks (128 MB by default) with three replicas by default.</p>
+<div class="tw"><table><thead><tr><th></th><th>Block</th><th>File</th><th>Object</th><th>HDFS</th></tr></thead><tbody>
+<tr><td>Interface</td><td>Disk device (NVMe, iSCSI)</td><td>POSIX over NFS or SMB</td><td>HTTP, the S3 API</td><td>Hadoop client RPC</td></tr>
+<tr><td>Who reads it</td><td>Usually one host</td><td>Many hosts</td><td>Any number of clients</td><td>Many clients</td></tr>
+<tr><td>Rename, append, in-place edit</td><td>Yes (through the filesystem on top)</td><td>Yes</td><td>No (general-purpose S3 API)</td><td>Rename and append yes, in-place edit no</td></tr>
+<tr><td>Where metadata lives</td><td>The host's filesystem</td><td>A metadata server or the NFS server</td><td>Gateway plus a bucket index</td><td>NameNode memory</td></tr>
+<tr><td>What limits scale</td><td>One volume, one host</td><td>Metadata server operations per second</td><td>Bucket index and gateway CPU; very large in practice</td><td>NameNode heap (rule of thumb from Cloudera: about 150 bytes per file, directory and block)</td></tr>
+<tr><td>Typical use on-prem</td><td>Postgres for positions and P&amp;L, MPP (massively parallel processing) engine local disks, Prefect's database</td><td>Shared home directories, tools that need POSIX, some GPU training scratch</td><td>The lake: Iceberg tables, raw files, PDFs, backups</td><td>Legacy only; in my view a poor choice for a new build</td></tr>
+</tbody></table></div>
+<p>The industry moved lakes from HDFS to object storage for three reasons. HDFS ties compute to storage, because DataNodes run on the same hosts as the jobs. The NameNode's memory caps the number of files. And object storage plus a table format lets storage and compute scale separately. The Lakehouse paper (CIDR 2021) is the standard argument for building warehouse features on open formats over low-cost object storage.</p>
+<p class="src">Sources: <a href="https://www.cloudera.com/blog/technical/the-small-files-problem.html">Cloudera: the small files problem</a> · <a href="https://www.cidrdb.org/cidr2021/papers/cidr2021_paper17.pdf">Lakehouse, CIDR 2021</a></p>
+
+<h3>The S3 API as the de facto standard</h3>
+<p>The <dfn>S3 API</dfn> is the HTTP interface AWS defined for S3, and every engine on a typical shortlist speaks it: Spark (through Hadoop S3A or Iceberg S3FileIO), Trino, StarRocks, Doris, ClickHouse, DuckDB and PyIceberg. That is why an on-prem lake is built on an S3-compatible store: the engines need no special connectors, and a later move between stores is a data copy.</p>
+<p>Two details trip up first-time on-prem builds.</p>
+<ul>
+<li><dfn>Signature Version 4</dfn> (SigV4) is how every request is authenticated: the client signs the request, including a timestamp, with a key derived from its secret access key, and the server recomputes the signature. Amazon S3 rejects a request whose timestamp is more than 15 minutes away from its own clock (error <code>RequestTimeTooSkewed</code>); AWS's general SigV4 guidance for most other services is tighter, at five minutes. S3-compatible stores generally apply a window similar to S3's.</li>
+<li><dfn>Path-style addressing</dfn> puts the bucket in the URL path (<code>https://s3.lake.internal/lake-bronze/key</code>). <dfn>Virtual-hosted-style addressing</dfn> puts it in the hostname (<code>https://lake-bronze.s3.lake.internal/key</code>), which needs wildcard DNS and a wildcard TLS certificate. On-prem teams usually choose path-style and set it in every client: <code>s3.path-style-access</code> in Iceberg and Trino, <code>fs.s3a.path.style.access</code> in Hadoop.</li>
+</ul>
+<p>"S3-compatible" is a claim about a subset. The full API is large, and stores differ on conditional writes, object lock, STS (temporary credentials), server-side encryption (SSE) modes, lifecycle actions and bucket notifications. The habit that saves months: run each engine's own read and write path against the candidate store in the POC (proof of concept), because Java, C++ and Python S3 clients exercise different corners of the API.</p>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>A common day-one failure: an engine defaults to virtual-hosted style, there is no wildcard DNS, and every call fails with a DNS or "bucket not found" error. Set path-style everywhere.</li>
+<li>Internal TLS needs the internal CA in each Java engine's truststore. "PKIX path building failed" in a Trino or Spark log means exactly this.</li>
+<li>Many stores let the admin pick any region name, but the client must sign with the region string the server expects, because the region is part of what SigV4 signs. A mismatch shows up as a signature error, which sends people chasing credentials.</li>
+<li>A load balancer in front of the gateways with a short idle timeout cuts long part uploads and slow range reads. Set its timeouts longer than your slowest part upload.</li>
+<li>Number to remember: LIST returns at most 1,000 keys per page. Any design that lists millions of keys per query is already broken.</li>
+</ul></aside>
+<p class="src">Sources: <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-authenticating-requests.html">S3 SigV4 authentication (15-minute window)</a> · <a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv.html">AWS SigV4 (five minutes for most services)</a> · <a href="https://aws.amazon.com/blogs/developer/clock-skew-correction/">AWS SDK clock skew correction</a> · <a href="https://iceberg.apache.org/docs/latest/aws/">Iceberg S3FileIO</a> · <a href="https://hadoop.apache.org/docs/stable/hadoop-aws/tools/hadoop-aws/index.html">Hadoop S3A</a></p>
+
+<h3>Self-hosted options in October 2026</h3>
+<aside class="box asof"><b class="lbl">As of Oct 2026</b><p>The an earlier design named MinIO. That needs correcting. MinIO removed admin features from the community console in May 2025, stopped publishing pre-built community binaries and Docker images in October 2025 ("distributed as source code only"), put the repository into maintenance mode in December 2025, and archived it on 25 April 2026. The README now says the repository is no longer maintained and points to the commercial AIStor product: "AIStor Free" is a standalone edition, and the distributed edition is "AIStor Enterprise". The code stays AGPLv3. The last community image is <code>RELEASE.2025-09-07T16-13-09Z</code>. Third-party rebuilds exist (Chainguard's <code>cgr.dev/chainguard/minio</code>, the pgsty/minio fork), but whoever runs them owns security patching. Source: <a href="https://github.com/minio/minio">github.com/minio/minio</a>.</p></aside>
+<div class="tw"><table><thead><tr><th>Product</th><th>Status (as of Oct 2026)</th><th>Licence</th><th>How it is built</th><th>Durability options</th><th>Lake extras</th><th>Operating burden</th></tr></thead><tbody>
+<tr><td>MinIO community</td><td>Archived Apr 2026; last image Sep 2025</td><td>AGPLv3</td><td>Every server is a gateway; objects hashed to erasure sets; metadata stored beside each object</td><td>Erasure coding</td><td>None new</td><td>Low to run, high to keep patched alone</td></tr>
+<tr><td>Ceph RGW</td><td>Tentacle v20.2.2 (Jun 2026); most mature</td><td>LGPL</td><td>RGW gateways over RADOS; MON (monitor) and MGR (manager) daemons; one OSD (object storage daemon) per disk; bucket index in a RADOS pool</td><td>Replication or erasure coding per pool; multisite</td><td>STS, SSE (Vault, Barbican, KMIP), S3 Object Lock, multisite; also block (RBD) and file (CephFS) from the same cluster</td><td>High: needs real Ceph skills or a support contract</td></tr>
+<tr><td>SeaweedFS</td><td>v4.48 (28 Sep 2026)</td><td>Apache-2.0 (plus a separate enterprise edition)</td><td>Masters (kept in agreement by the Raft consensus protocol) track volumes; volume servers hold append-only volume files; filer keeps names in a pluggable store (Postgres, LevelDB, Redis and others); S3 gateway</td><td>Replication for hot data; RS(10,4) erasure coding of sealed warm volumes</td><td>S3 table buckets with a built-in Iceberg REST catalog (port 8181) and server-side compaction; Lakekeeper's examples moved from MinIO to SeaweedFS in v0.13</td><td>Medium: several components; the filer store is critical</td></tr>
+<tr><td>RustFS</td><td>1.0.0 (16 Sep 2026), 1.0.1 (3 Oct 2026); young</td><td>Apache-2.0</td><td>Erasure-set design similar to MinIO</td><td>Erasure coding</td><td>Versioning, object lock and site replication listed as available; S3 Tables (Iceberg REST) listed as preview</td><td>Low on paper; unproven at scale</td></tr>
+<tr><td>Garage</td><td>v2.x</td><td>AGPLv3</td><td>No central master; metadata in LMDB (an embedded key-value database) on each node; zones for geo-distribution</td><td>Replication only (no erasure coding)</td><td>Basic S3</td><td>Low; built for small geo-distributed self-hosting</td></tr>
+</tbody></table></div>
+<p>My view: Ceph RGW is the default for a regulated firm that wants maturity and can staff or buy Ceph expertise, and its block and file services can also serve Postgres volumes and the GPU POC. SeaweedFS is the lighter candidate and the most lake-aware, with a built-in Iceberg catalog, though that catalog is new and the team would still want a standalone catalog it controls. RustFS is worth a pilot alongside the main store until it has a longer production record. Garage fits a small multi-site setup more than a 40 TB analytics workload, because replication-only storage costs 2x to 3x raw capacity. MinIO community should not be the base of a new build; AIStor is an option only if the team accepts a commercial licence.</p>
+<aside class="box senior"><b class="lbl">Senior lens</b><p>The S3 API is the exit door that makes "no vendor lock-in" real: if the engines and the catalog only speak S3 and Iceberg REST, switching stores later is a bulk copy plus a pointer update, so the store decision is reversible at a known cost. The irreversible part is operational: who is paged at 2 a.m. when a Ceph placement group (its unit of data placement, covered below) is stuck or a filer database is corrupt. A senior engineer prices the product by team skill and support, compares two or three candidates in a POC that includes failure drills, and keeps the store's feature use to the common subset (multipart, range GET, versioning, lifecycle, object lock) so the exit door stays open. MinIO's path from open source to archived in about a year is the case study for checking a project's governance and funding as well as its features.</p></aside>
+<p class="src">Sources: <a href="https://github.com/minio/minio">MinIO repository</a> · <a href="https://ceph.io">Ceph</a> · <a href="https://docs.ceph.com/en/latest/radosgw/encryption/">Ceph RGW encryption</a> · <a href="https://docs.ceph.com/en/latest/radosgw/s3/bucketops/">Ceph RGW bucket operations (object lock)</a> · <a href="https://github.com/seaweedfs/seaweedfs">SeaweedFS</a> · <a href="https://github.com/rustfs/rustfs">RustFS</a> · <a href="https://garagehq.deuxfleurs.fr/">Garage</a></p>
+
+<h3>Inside a self-hosted object store</h3>
+<p>Every self-hosted object store has three jobs, whatever the product calls them.</p>
+<ul>
+<li>The <dfn>gateway</dfn> speaks the S3 API: it terminates TLS, checks the SigV4 signature, applies bucket policies and routes the request. Gateways are usually stateless, so you run several behind a load balancer.</li>
+<li>The <dfn>metadata store</dfn> answers "which bytes belong to this key, which versions exist, what are its tags and locks". The per-bucket part of it is the <dfn>bucket index</dfn>, which is what LIST reads.</li>
+<li>The <dfn>data nodes</dfn> hold the bytes on disks, either as full replicas or as erasure-coded chunks, and run background repair and checksums.</li>
+</ul>
+<pre class="mermaid">flowchart LR
+  E["Engines Spark Trino StarRocks"] --> LB["Load balancer"]
+  LB --> G1["S3 gateway 1"]
+  LB --> G2["S3 gateway 2"]
+  G1 --> MD["Metadata store and bucket index"]
+  G2 --> MD
+  G1 --> DN["Data nodes"]
+  G2 --> DN
+  MD --> NV["NVMe devices"]
+  DN --> HD["HDD or NVMe pools"]
+  CB["Cluster map service"] -.-> DN</pre>
+<div class="tw"><table><thead><tr><th>Product</th><th>Gateway</th><th>Metadata</th><th>Data</th><th>Cluster brain</th></tr></thead><tbody>
+<tr><td>Ceph</td><td>RGW daemons</td><td>Bucket index objects in a RADOS pool, split into shards</td><td>OSDs, one per disk</td><td>MON quorum holds the cluster map; the CRUSH algorithm computes placement</td></tr>
+<tr><td>SeaweedFS</td><td>S3 gateway (stateless)</td><td>Filer with a pluggable store</td><td>Volume servers with append-only volume files and an in-memory index</td><td>Masters (Raft) track volume locations and stay out of the read path</td></tr>
+<tr><td>MinIO and RustFS</td><td>Every server</td><td>Stored beside each object on its erasure set</td><td>Drives grouped into erasure sets</td><td>Deterministic hashing of the key picks the erasure set</td></tr>
+<tr><td>Garage</td><td>Every node</td><td>LMDB (default) or SQLite on each node, replicated</td><td>Data blocks replicated across nodes and zones</td><td>A layout the admin assigns; no central master</td></tr>
+</tbody></table></div>
+<p><dfn>CRUSH</dfn> is Ceph's placement algorithm: given an object name and the cluster map, every client and OSD computes the same set of disks for that object, so no central lookup table sits in the data path.</p>
+<p>Where each part limits a lake:</p>
+<ul>
+<li>Gateway CPU is spent on TLS, signature checks and, in some designs, erasure encoding. Large sequential reads are cheap per byte; thousands of tiny requests are expensive per byte.</li>
+<li>The metadata store limits LIST speed and small-object PUT rate. Ceph's docs advise no more than 100,000 entries per bucket-index shard; Ceph reshards automatically above that (dynamic resharding is on by default), and writes to that bucket can pause briefly while it happens.</li>
+<li>Disks limit throughput for large objects (bandwidth) and for small objects (IOPS). An HDD that streams a 512 MB Parquet file well will struggle with thousands of 100 KB reads.</li>
+</ul>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Ceph's hardware guide says RGW index and log pools belong on enterprise SSDs even when bulk data sits on HDDs, and HDD OSDs gain from moving their write-ahead log and database (BlueStore WAL and DB) to a shared SSD. The usual on-prem pattern is NVMe for metadata, HDD for bulk.</li>
+<li>One bucket holding tens of millions of objects is a known Ceph pain point: listing slows and resharding events appear in logs. Plan bucket count and expected object count together.</li>
+<li>In SeaweedFS the filer store is the metadata store. Back it up and monitor it like a production database, because losing it means losing the names of every file.</li>
+<li>Gateways scale horizontally; metadata usually does not scale as easily. When LIST or small-PUT latency rises while disk utilisation is low, look at the metadata tier first.</li>
+<li>SeaweedFS packs small files into large append-only volume files (its design follows Facebook's Haystack paper), so it handles millions of small objects better than designs that create one or more disk files per object.</li>
+</ul></aside>
+<p class="src">Sources: <a href="https://docs.ceph.com/en/latest/radosgw/dynamicresharding/">Ceph dynamic resharding</a> · <a href="https://docs.ceph.com/en/latest/start/hardware-recommendations/">Ceph hardware recommendations</a> · <a href="https://github.com/seaweedfs/seaweedfs">SeaweedFS README</a> · <a href="https://garagehq.deuxfleurs.fr/documentation/reference-manual/configuration/">Garage configuration</a></p>
+
+<h3>Durability: replication and erasure coding</h3>
+<p><dfn>Durability</dfn> is the probability that stored data is never lost. <dfn>Availability</dfn> is the probability that you can read or write it right now. A cluster can be durable but unavailable (data safe, too many nodes down to serve it). Two methods protect data.</p>
+<p><dfn>Replication</dfn> stores full copies on different disks or hosts. Three copies (a <dfn>replication factor</dfn> of 3) survive two failures and cost 3x raw capacity. Reads can go to any copy, and rebuilding a lost copy reads one surviving copy.</p>
+<p><dfn>Erasure coding</dfn> (EC) splits data into <em>k</em> data chunks and computes <em>m</em> parity chunks, usually with <dfn>Reed-Solomon</dfn> codes. Any <em>k</em> of the <em>k+m</em> chunks rebuild the data. The arithmetic every operator carries:</p>
+<ul>
+<li>Raw overhead is (k+m)/k. A 4+2 layout costs 1.5x; 8+3 costs 1.375x; 10+4 costs 1.4x.</li>
+<li>It survives <em>m</em> lost chunks, as long as each chunk sits in a different failure domain.</li>
+<li>Rebuilding one lost chunk reads <em>k</em> chunks from <em>k</em> other places. In 8+3 that is 8x the lost data crossing the network, against 1x for replication. Rebuilds are slower and noisier.</li>
+<li>A write touches k+m disks and a read touches at least k, so the slowest of those disks sets the latency.</li>
+</ul>
+<div class="tw"><table><thead><tr><th>Layout</th><th>Raw per usable TB</th><th>Failures survived</th><th>Failure domains needed (plus one to self-heal)</th><th>Rebuild read per lost TB</th><th>Fits</th></tr></thead><tbody>
+<tr><td>3x replication</td><td>3.0 TB</td><td>2</td><td>3 (4)</td><td>1 TB</td><td>Metadata, small objects, small clusters</td></tr>
+<tr><td>EC 2+2 (Ceph default profile)</td><td>2.0 TB</td><td>2</td><td>4 (5)</td><td>2 TB</td><td>Testing; little saving</td></tr>
+<tr><td>EC 4+2</td><td>1.5 TB</td><td>2</td><td>6 (7)</td><td>4 TB</td><td>A 6 to 10 host cluster</td></tr>
+<tr><td>EC 8+3</td><td>1.375 TB</td><td>3</td><td>11 (12)</td><td>8 TB</td><td>Large clusters</td></tr>
+<tr><td>EC 10+4 (SeaweedFS warm volumes)</td><td>1.4 TB</td><td>4</td><td>14 (15)</td><td>10 TB</td><td>Large clusters, cold data</td></tr>
+</tbody></table></div>
+<p><dfn>Failure domains</dfn> are the things that fail together: a disk, a host, a rack, a power feed, a room, a site. If the failure domain is "host", a 4+2 layout needs at least six hosts so each chunk sits on a different one, and a seventh so the cluster can rebuild a dead host's chunks somewhere legal. With exactly six hosts, losing one leaves the pool degraded until the host returns. Ceph's docs recommend setting an EC pool's <code>min_size</code> (the minimum number of chunks a placement group needs before it serves I/O) to k+1 or more, to prevent loss of writes and data. For a 4+2 pool that means any placement group missing two chunks stops serving reads and writes until one comes back.</p>
+<p>The <dfn>small-object penalty</dfn>: EC cuts every object into k+m chunks. A 64 KB object in 8+3 becomes eleven 8 KB chunks, eleven disk writes and eleven entries to track, with padding up to the stripe unit (4 KB by default in Ceph). Small objects are cheaper to replicate. SeaweedFS sidesteps this by erasure-coding whole sealed volumes in 1 GB chunks, so small files never pay per-object EC cost. A common Ceph pattern is a replicated NVMe pool for indexes and small objects, and an EC HDD pool for large data files. Parquet files of 128 MB to 1 GB suit EC well.</p>
+<p><dfn>Bit rot</dfn> is silent corruption: a disk returns wrong bytes without reporting an error. Stores defend with checksums on every chunk and <dfn>scrubbing</dfn>, a background job that reads stored data and compares copies or checksums. Ceph's defaults: a light scrub of each placement group between daily and weekly (<code>osd_scrub_min_interval</code> 1 day, <code>osd_scrub_max_interval</code> 7 days) and a <dfn>deep scrub</dfn>, which reads all data and verifies checksums, weekly (<code>osd_deep_scrub_interval</code> 7 days). Deep scrubs cost disk bandwidth, so operators confine them to quiet hours, which means after the evening reconciliation and outside MCX trading hours.</p>
+<h4>A worked sizing example</h4>
+<p>Assume 40 TB of logical data today and a plan for 80 TB within three years (my assumption, for illustration). With EC 4+2: 80 x 1.5 = 120 TB raw. Clusters must not run full, because a host failure needs free space on the survivors for the rebuild; Ceph warns at 85% full by default (<code>mon_osd_nearfull_ratio</code> 0.85), and a common planning ceiling is about 70% (a rule of thumb). That gives 120 / 0.7, about 171 TB raw. With 3x replication the same data needs 240 / 0.7, about 343 TB raw. At this scale the host count is set by failure domains (seven hosts for 4+2) and by throughput, and capacity per host comes out small. In my view that makes an all-flash design worth pricing against HDD before assuming HDD is cheaper per useful IOPS.</p>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> Median query time on lake tables is unchanged, but p99 latency (the slowest 1% of requests, the <dfn>tail latency</dfn>) for range GETs climbs from tens of milliseconds to seconds. Dashboards that run many small queries feel sluggish; averages look fine. <b>Diagnosis.</b> In an EC pool every read waits for k chunks from k disks, so one degrading disk sits on the read path of a large share of objects. Per-disk latency shows one outlier (in Ceph, <code>ceph osd perf</code> lists commit and apply latency per OSD), and its SMART counters (the drive's self-reported health statistics) show growing reallocated or pending sectors. The disk has not failed, so nothing marked it out. <b>Fix.</b> Mark that OSD out so data rebalances away from it, throttle backfill so the rebalance does not hurt market-hours traffic, then replace the drive. <b>Lesson.</b> Alert on per-disk latency outliers and tail percentiles; a cluster average hides one slow disk among a hundred. A slow disk hurts EC more than a dead one, because a dead disk is excluded and a slow one is waited for.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> An ingestion task fails intermittently with HTTP 403 <code>RequestTimeTooSkewed</code> or signature errors, only when its pod lands on one particular compute node. If a host that runs a Ceph monitor drifts the same way, Ceph raises a <code>MON_CLOCK_SKEW</code> health warning. <b>Diagnosis.</b> After a reboot, the time daemon on that node did not start (or cannot reach its server), and the node's clock drifted. SigV4 signatures carry a timestamp, and S3 rejects requests more than 15 minutes off its clock (S3-compatible stores apply a similar window). Ceph monitors warn at a far smaller drift: <code>mon_clock_drift_allowed</code> defaults to 0.05 seconds. <b>Fix.</b> Run chrony or ntpd on every host from configuration management, point them at internal time servers with several upstream sources, and alert on clock offset. <b>Lesson.</b> Time sync is part of the storage stack. Check the client's clock before debugging credentials when signatures fail.</p></aside>
+<p class="src">Sources: <a href="https://docs.ceph.com/en/latest/rados/operations/erasure-code/">Ceph erasure code</a> · <a href="https://docs.ceph.com/en/latest/rados/configuration/osd-config-ref/">Ceph OSD config (scrub)</a> · <a href="https://docs.ceph.com/en/latest/rados/configuration/mon-config-ref/">Ceph monitor config</a> · <a href="https://github.com/seaweedfs/seaweedfs/wiki/Erasure-Coding-for-warm-storage">SeaweedFS erasure coding</a> · <a href="https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-authenticating-requests.html">S3 SigV4 authentication</a> · <a href="https://aws.amazon.com/blogs/developer/clock-skew-correction/">AWS clock skew</a> · <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html">AWS S3 performance</a> · <a href="https://www.cloudera.com/blog/technical/the-small-files-problem.html">Cloudera small files</a></p>
+
+<h3>What operators watch on a running store</h3>
+<p>A store can answer health checks while every PUT waits on a saturated index, so the useful signals measure progress and user-facing latency, and liveness checks come second. A <dfn>placement group</dfn> (PG) is Ceph's unit of placement: objects map to PGs and PGs map to OSDs, and a healthy PG reports <code>active+clean</code>. Ceph exports metrics to Prometheus through its manager module, and SeaweedFS and Garage expose Prometheus endpoints too.</p>
+<div class="tw"><table><thead><tr><th>Signal</th><th>Why it matters</th><th>Alert idea (my judgement)</th></tr></thead><tbody>
+<tr><td>Gateway latency p50 and p99, per operation (GET, PUT, LIST, DELETE)</td><td>What engines and users feel</td><td>p99 well above its weekly baseline for several minutes</td></tr>
+<tr><td>5xx and 503 rate</td><td>Saturation or failing components</td><td>Any sustained rise</td></tr>
+<tr><td>Data protection state (Ceph PGs degraded or undersized; SeaweedFS missing replicas or EC shards)</td><td>How many more failures the data can take right now</td><td>Degraded for longer than a normal rebuild takes</td></tr>
+<tr><td>Rebuild or backfill bytes remaining over time</td><td>Progress of recovery</td><td>No decrease for a set interval</td></tr>
+<tr><td>Capacity per pool and per bucket, growth rate, days until the warning threshold</td><td>Planning and runaway growth (the versioning leak in the next section)</td><td>Fewer days left than the hardware lead time</td></tr>
+<tr><td>Per-disk latency and SMART counters</td><td>The slow-disk incident above</td><td>One disk far slower than its peers</td></tr>
+<tr><td>Scrub errors and inconsistent objects</td><td>Bit rot found</td><td>Any</td></tr>
+<tr><td>Bucket-index shard fill (Ceph) or filer database latency (SeaweedFS)</td><td>Metadata tier health</td><td>Shards approaching 100,000 entries; filer query latency rising</td></tr>
+<tr><td>Clock offset per host</td><td>Signatures and monitor quorum</td><td>Offset approaching Ceph's 0.05 s</td></tr>
+<tr><td>Replication lag to the DR (disaster recovery) site</td><td>The real RPO (recovery point objective: how much recent data a site loss would cost)</td><td>Lag above the RPO target</td></tr>
+</tbody></table></div>
+<p class="src">Sources: <a href="https://docs.ceph.com/en/latest/mgr/prometheus/">Ceph Prometheus module</a> · <a href="https://docs.ceph.com/en/latest/rados/configuration/mon-config-ref/">Ceph monitor config</a> · <a href="https://docs.ceph.com/en/latest/radosgw/dynamicresharding/">Ceph dynamic resharding</a></p>
+<aside class="box trap"><b class="lbl">Common mistake</b><p>Choosing an erasure-coding width for its storage saving alone. A 10+4 layout looks cheap at 1.4x, but with "host" as the failure domain it needs at least 14 hosts, rebuilds read 10x the lost data, and every small object turns into 14 tiny writes. For a cluster of six to ten hosts, 4+2 for large data files plus a replicated pool for indexes and small objects is a common and defensible choice. A related mistake is treating key prefixes as directories: "renaming the 2025 folder" on object storage copies every byte under it.</p></aside>
+<dl class="nums">
+<dt>3,500 / 5,500</dt><dd>AWS S3 writes / reads per second per partitioned prefix, at minimum. On-prem stores have no per-prefix figure; gateway CPU and the metadata tier set the limits.</dd>
+<dt>1,000</dt><dd>Maximum keys per LIST page (and per DeleteObjects batch) on AWS.</dd>
+<dt>5 MiB to 5 GiB, 10,000 parts</dt><dd>AWS multipart part size range and part limit; maximum object 48.8 TiB (as of Oct 2026).</dd>
+<dt>32 MB</dt><dd>Iceberg S3FileIO default multipart part size.</dd>
+<dt>15 minutes</dt><dd>Amazon S3's SigV4 clock-skew tolerance before <code>RequestTimeTooSkewed</code> (AWS's general SigV4 rule for most other services is five minutes).</dd>
+<dt>0.05 s</dt><dd>Ceph <code>mon_clock_drift_allowed</code> default.</dd>
+<dt>(k+m)/k</dt><dd>Erasure-coding raw overhead: 4+2 = 1.5x, 8+3 = 1.375x, 10+4 = 1.4x; replication 3x.</dd>
+<dt>k+m (+1)</dt><dd>Failure domains needed for an EC layout, plus one so it can self-heal.</dd>
+<dt>100,000</dt><dd>Ceph's advised maximum entries per bucket-index shard (<code>rgw_max_objs_per_shard</code>).</dd>
+<dt>1 day / 7 days</dt><dd>Ceph scrub and deep-scrub interval defaults (light scrub between 1 and 7 days, deep scrub every 7).</dd>
+<dt>~150 bytes</dt><dd>HDFS NameNode memory per file, directory or block (Cloudera rule of thumb).</dd>
+<dt>128 MB, 3 replicas</dt><dd>HDFS default block size and replication.</dd>
+</dl>
+<aside class="box say"><b class="lbl">Say this</b><p>"Object storage gives you immutable objects under keys in a flat namespace, behind the S3 API. Two properties shape the whole lake: there is no rename and no append, and consistency is per key. So you cannot commit a table by renaming a directory as on HDFS. That is why we put Iceberg on top: a commit writes new immutable files and then swaps one pointer atomically in the catalog. On product choice, I should correct something from my an earlier design: MinIO's community edition was archived in April 2026, so I would compare Ceph RGW and SeaweedFS instead. I have not run either in production, so I would decide with a POC: run warp and the real engines against each, measure p99 range-GET latency and small-PUT rate, and, most important, pull a disk and a whole node mid-test and watch rebuild time and query tail latency. Under 40 TB, failure domains and throughput size the cluster more than capacity: erasure coding 4+2 needs six hosts, seven to self-heal."</p></aside>
+
+</section>
+<section class="topic" id="lake-setup"><h2>A suitable object-storage setup for the lake</h2>
+<p class="lede">Choosing the store is half the decision. The other half is the layout on top of it: which buckets and prefixes, who can touch what, how long objects live, and how big the files are. These choices decide whether a query over three years of NIFTY options ticks takes seconds or minutes, and whether the team can hand an auditor the exact trade file it received in 2026. At under 40 TB most of this is cheap to get right on day one and expensive to change later.</p>
+
+<h3>Zones: landing, bronze, silver, gold</h3>
+<p>A <dfn>zone</dfn> is a stage of the lake with its own rules for format, writers, readers and retention. The common naming is the <dfn>medallion architecture</dfn>: bronze for raw data, silver for cleaned and conformed data, gold for business-ready data. Many teams add a <dfn>landing zone</dfn> in front of bronze that keeps files exactly as received.</p>
+<p>One domain term first: a <dfn>bhavcopy</dfn> is the end-of-day file NSE and BSE publish with each instrument's open, high, low, close, volume and settlement data.</p>
+<div class="tw"><table><thead><tr><th>Zone</th><th>What lands there</th><th>Format</th><th>Who writes</th><th>Who reads</th></tr></thead><tbody>
+<tr><td>Landing</td><td>Loan tapes and trustee-report PDFs from structured-credit counterparties, NSE and BSE bhavcopy files, MCX settlement files, toll-road collection reports, fund-administrator NAV files, investor KYC documents</td><td>As received: CSV, XML, PDF, ZIP</td><td>Ingestion service accounts only</td><td>Bronze loaders; auditors on request</td></tr>
+<tr><td>Bronze</td><td>The same data loaded into Iceberg tables, plus ingestion columns: source object key, load time, file checksum; intraday ticks land here directly from the feed handler</td><td>Iceberg (Parquet), append-only</td><td>Ingestion jobs</td><td>Silver jobs, data engineers</td></tr>
+<tr><td>Silver</td><td>Deduplicated ticks, corporate-action-adjusted prices, a security master mapping NSE symbols, ISINs and MCX contract codes, positions joined to instruments, loan cash flows parsed from tapes and PDFs</td><td>Iceberg, merge and upsert allowed</td><td>Transformation jobs (dbt, Spark, Prefect flows)</td><td>Gold jobs, quants, risk</td></tr>
+<tr><td>Gold</td><td>Daily P&amp;L by book, risk by desk, mutual fund NAV inputs and outputs, investor holdings, annuity receipts against schedule for the toll-road assets</td><td>Iceberg, modelled marts</td><td>Modelled transformations only</td><td>MPP engine, BI, internal AI agents agents</td></tr>
+</tbody></table></div>
+<pre class="mermaid">flowchart LR
+  SF["SFTP drops loan tapes and PDFs"] --> LD["lake-landing raw files"]
+  FD["Market feeds ticks and bhavcopy"] --> BR["lake-bronze Iceberg"]
+  LD --> BR
+  BR --> SV["lake-silver Iceberg"]
+  SV --> GD["lake-gold Iceberg"]
+  GD --> EN["MPP engine StarRocks Doris or Trino"]
+  GD --> AG["internal AI agents agents"]
+  CT["Iceberg REST catalog"] -.-> BR
+  CT -.-> SV
+  CT -.-> GD
+  EN --> SC["lake-scratch spill and exchange"]</pre>
+<p>Bronze is the replay button. When a silver rule turns out wrong (a bonus issue adjusted twice, a loan tape column misread), you fix the rule and rebuild silver from bronze. That only works if bronze is append-only and kept long enough, which is a retention decision, so make it explicitly.</p>
+<h3>Bucket strategy and the warehouse layout</h3>
+<p>Bucket boundaries matter because many controls only exist at bucket level: versioning, object lock, lifecycle rules, replication to the DR site, default encryption, quotas and per-bucket metrics. Access policies can go down to prefix level.</p>
+<div class="tw"><table><thead><tr><th>Strategy</th><th>Strengths</th><th>Weaknesses</th></tr></thead><tbody>
+<tr><td>One bucket per zone</td><td>Few buckets; lifecycle, versioning and lock settings match each zone's rules</td><td>Domain isolation relies on prefix policies</td></tr>
+<tr><td>One bucket per domain (markets, credit, funds)</td><td>Clear ownership and cost per domain</td><td>Each bucket mixes zones with different retention needs</td></tr>
+<tr><td>Zone by domain</td><td>Finest control</td><td>Bucket sprawl; every policy and replication rule multiplied</td></tr>
+</tbody></table></div>
+<p>A reasonable default (my judgement): a small fixed set of buckets by zone and sensitivity, with domains as Iceberg namespaces inside each warehouse.</p>
+<ul>
+<li><code>lake-landing</code>: files as received. Versioned.</li>
+<li><code>lake-records</code>: regulated records that must not change, with object lock. Kept apart so lock settings never touch table storage.</li>
+<li><code>lake-bronze</code>, <code>lake-silver</code>, <code>lake-gold</code>: Iceberg warehouses.</li>
+<li><code>lake-restricted</code>: an Iceberg warehouse for mutual fund investor records and other personal data, with its own policies and encryption keys.</li>
+<li><code>lake-scratch</code>: engine spill, exchange and staging data, Spark checkpoints. Expires in days; no versioning, no replication.</li>
+<li><code>lake-logs</code>: store access logs and engine logs, on their own retention.</li>
+</ul>
+<p>A <dfn>warehouse</dfn> in Iceberg terms is the root location under which a catalog creates table directories. A table's <dfn>location</dfn> holds a <code>metadata/</code> prefix (metadata files, manifest lists, manifests) and a <code>data/</code> prefix (Parquet files).</p>
+<pre><code class="lang-text">s3://lake-silver/warehouse/
+  markets/                                  # Iceberg namespace (domain)
+    ticks_nse/
+      metadata/
+        00041-6c1e...metadata.json          # table metadata, one per commit
+        snap-7781...avro                    # manifest list, one per snapshot
+        a2b4...-m0.avro                     # manifest
+      data/
+        ts_day=2026-10-13/00000-12-9f3c...parquet
+  credit/
+    loan_cashflows/ ...
+  funds/
+    nav_daily/ ...
+
+# Same file with write.object-storage.enabled=true (hash dirs, illustrative):
+      data/0101/0110/1001/10110010/ts_day=2026-10-13/00000-12-9f3c...parquet</code></pre>
+<p>Iceberg can hash file paths (<code>write.object-storage.enabled</code>, default false) so writes spread across many prefixes. That exists for S3 and other cloud stores that throttle requests per prefix. On-prem there is no per-prefix limit to dodge, so a reasonable default is to leave it off and keep paths readable for operators.</p>
+<p>Scratch and logs get their own buckets because their life is different: high churn, short expiry, no value in DR. Mixed into a warehouse bucket they inflate version counts, confuse capacity metrics and compete for the same index. Some engines stage intermediate data on object storage, for example Trino's fault-tolerant execution writes exchange data to a configured exchange location, and that belongs in scratch.</p>
+<p class="src">Sources: <a href="https://iceberg.apache.org/docs/latest/aws/">Iceberg AWS integration (object store layout)</a> · <a href="https://iceberg.apache.org/docs/latest/configuration/">Iceberg configuration</a></p>
+
+<h3>Versioning, object lock and lifecycle</h3>
+<p><dfn>Versioning</dfn> keeps every version of an object. An overwrite creates a new current version and keeps the old one as a <dfn>noncurrent version</dfn>; a DELETE adds a <dfn>delete marker</dfn> and keeps the data. It protects against mistakes, and it costs storage until noncurrent versions are expired.</p>
+<p><dfn>Object lock</dfn> makes object versions undeletable for a retention period, which gives <dfn>WORM</dfn> storage (write once, read many). It requires versioning. In <dfn>governance mode</dfn>, users with a special permission can override the lock; in <dfn>compliance mode</dfn>, nobody can shorten or remove it, including administrators. A <dfn>legal hold</dfn> locks an object with no end date until it is released. Ceph RGW implements the S3 object lock API, and recent Ceph releases allow enabling it on an existing versioned bucket (older ones required it at bucket creation). In a multisite setup, check that the lock configuration and retention are in force on the secondary site before relying on them there.</p>
+<p>A <dfn>lifecycle rule</dfn> is a bucket-level policy the store runs in the background: expire objects after N days, expire noncurrent versions after N days, abort multipart uploads left incomplete, or transition objects to another storage class. <dfn>Tiering</dfn> is that last action: moving data between pools, for example from NVMe to HDD. In Ceph a transition moves the object's data to the pool of another storage class while its key stays the same, so readers, Iceberg metadata included, keep working.</p>
+<div class="tw"><table><thead><tr><th>Bucket</th><th>Versioning</th><th>Object lock</th><th>Lifecycle</th></tr></thead><tbody>
+<tr><td>lake-landing</td><td>On</td><td>Off (or governance)</td><td>Noncurrent versions expire after a short window; abort incomplete uploads</td></tr>
+<tr><td>lake-records</td><td>On (required)</td><td>Compliance mode, period set by compliance</td><td>Expire only after retention ends</td></tr>
+<tr><td>Iceberg warehouses</td><td>Optional; if on, expire noncurrent versions after 7 to 14 days (my judgement)</td><td>Off</td><td>Abort incomplete uploads; no age-based expiry of current objects</td></tr>
+<tr><td>lake-scratch</td><td>Off</td><td>Off</td><td>Expire everything after 1 to 3 days</td></tr>
+</tbody></table></div>
+<p>Why no object lock on the Iceberg warehouses: Iceberg needs to delete files. Compaction rewrites small files into large ones, snapshot expiry deletes files no snapshot references, orphan cleanup deletes failed-write leftovers. A locked warehouse turns every one of those into an error and storage grows without limit. Keep the legally immutable copy as source files in <code>lake-records</code>. For "show me the book as of 31 March", use Iceberg tags (named snapshots with their own retention), which keep a table version readable without locking objects.</p>
+<p>SEBI and other regulators set retention periods by record type. The numbers come from the compliance team and go into the lock configuration; the platform's job is to make them enforceable and auditable.</p>
+<pre><code class="lang-text">// lake-scratch: everything is temporary
+{"Rules": [{"ID": "scratch-expiry", "Status": "Enabled", "Filter": {"Prefix": ""},
+            "Expiration": {"Days": 3},
+            "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}}]}
+
+// lake-silver (Iceberg warehouse): never expire current objects by age
+{"Rules": [{"ID": "undo-window", "Status": "Enabled", "Filter": {"Prefix": "warehouse/"},
+            "NoncurrentVersionExpiration": {"NoncurrentDays": 14},
+            "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 2}}]}</code></pre>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> Queries on the bronze bhavcopy table for dates before July fail with <code>NoSuchKey</code> or file-not-found errors; recent dates work. <b>Diagnosis.</b> Someone added a lifecycle rule "expire objects under <code>bronze/</code> older than 90 days", meant for raw CSV staging. The Iceberg table's current snapshot still referenced Parquet files written more than 90 days ago, because old partitions are never rewritten. The store deleted live data that only Iceberg metadata knew was live. A second common variant: <code>remove_orphan_files</code> run with a one-hour threshold while a three-hour backfill was still writing, so the backfill's not-yet-committed files looked orphaned and were deleted, and its commit then pointed at missing files. Iceberg's docs warn about exactly this and default to 3 days. <b>Fix.</b> Remove the rule. Restore the deleted objects from noncurrent versions if versioning was on, or from the DR copy. If neither exists, roll the table back to a snapshot whose files all exist and re-ingest from landing. <b>Lesson.</b> Only Iceberg's own maintenance (snapshot expiry, orphan cleanup with a threshold longer than the longest write) may delete from a warehouse prefix. Retention by age is a table operation: delete the rows, then expire snapshots.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> The store's used capacity is about twice the sum of table sizes reported by the catalog, and growing faster than ingest. <b>Diagnosis.</b> Versioning is on for the warehouse buckets with no noncurrent-version rule. Nightly compaction rewrites recent partitions; snapshot expiry then deletes the replaced files, but each DELETE only adds a delete marker, and every compacted file lives on as a noncurrent version. A table compacted weekly can hold several full copies of its history. Incomplete multipart uploads from killed jobs add more hidden bytes. <b>Fix.</b> Add <code>NoncurrentVersionExpiration</code> and <code>AbortIncompleteMultipartUpload</code> rules, wait for the lifecycle run, and track "versioned bytes minus current bytes" as a capacity metric. <b>Lesson.</b> Versioning without a noncurrent-version rule is a storage leak. Decide the undo window on purpose and encode it.</p></aside>
+<p class="src">Sources: <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html">AWS S3 versioning</a> · <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html">AWS S3 object lock</a> · <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lifecycle-mgmt.html">AWS S3 lifecycle</a> · <a href="https://docs.ceph.com/en/latest/radosgw/s3/bucketops/">Ceph RGW bucket operations</a> · <a href="https://docs.ceph.com/en/latest/radosgw/placement/">Ceph storage classes and transitions</a> · <a href="https://ceph.io/en/news/blog/2025/rgw-deep-dive-3/">Ceph RGW deep dive: versioning and object lock</a> · <a href="https://iceberg.apache.org/docs/latest/maintenance/">Iceberg maintenance</a></p>
+
+<h3>Disaster recovery and site replication</h3>
+<p><dfn>RPO</dfn> (recovery point objective) is how much recent data you can afford to lose; <dfn>RTO</dfn> (recovery time objective) is how long you can be down. <dfn>Site replication</dfn> copies objects from one cluster to another, usually asynchronously, so the RPO equals the replication lag at the moment of disaster.</p>
+<ul>
+<li>Ceph RGW multisite: a realm holds zonegroups, a zonegroup holds zones, each zone is its own Ceph cluster. Zones are active-active by default (a secondary can be made read-only), and metadata operations such as creating users go through the master zone.</li>
+<li>SeaweedFS: <code>filer.sync</code> replays each filer's change log into another cluster, one-way or both ways, and keeps checkpoints so it can resume.</li>
+<li>RustFS lists bucket and site replication as available.</li>
+</ul>
+<p>Iceberg adds three traps that plain bucket replication does not handle.</p>
+<ol>
+<li>The catalog is state too. If the catalog's database (Postgres for Polaris or Lakekeeper, for example) is not backed up and restored in step with the buckets, the DR site has data with no table pointers, or pointers to metadata that has not arrived yet.</li>
+<li>Replication order is not commit order. A <code>metadata.json</code> can arrive at the DR site before the data files it references. A reader there sees a table that fails on missing files. At failover, register each table at the newest snapshot whose files all exist at the DR site.</li>
+<li>Iceberg metadata stores absolute paths, bucket and endpoint included. If the DR site uses different bucket names or a different endpoint, every path breaks. Keep names identical across sites, or plan to use Iceberg's rewrite-table-path action. Relative paths are part of the not-yet-adopted v4 spec work, and Iceberg 1.12.0 (Sep 2026) contains the first v4 code (as of Oct 2026).</li>
+</ol>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Run the DR drill with queries: fail over, point a Trino or StarRocks instance at the DR catalog, and run the gold queries that matter (yesterday's NAV, today's P&amp;L). Checking that replication is "green" proves only that bytes moved.</li>
+<li>Scratch and logs need no DR copy. Excluding them saves link bandwidth for what matters.</li>
+<li>Replication lag is a metric to alert on. A replication backlog after month-end compaction (which rewrites a lot of data at once) is a common surprise.</li>
+<li>The landing zone is the cheapest DR insurance: if raw files survive, everything downstream can be rebuilt, slowly.</li>
+</ul></aside>
+<p class="src">Sources: <a href="https://docs.ceph.com/en/latest/radosgw/multisite/">Ceph multisite</a> · <a href="https://github.com/seaweedfs/seaweedfs/wiki/Filer-Active-Active-cross-cluster-continuous-synchronization">SeaweedFS filer.sync</a> · <a href="https://github.com/rustfs/rustfs">RustFS</a> · <a href="https://iceberg.apache.org/spec/">Iceberg spec</a> · <a href="https://github.com/apache/iceberg/releases">Iceberg releases</a> · <a href="https://iceberg.apache.org/docs/latest/maintenance/">Iceberg maintenance</a></p>
+
+<h3>Access control: prefix policies, one identity per engine, credential vending</h3>
+<p>An <dfn>IAM policy</dfn> is a JSON document of allowed or denied actions on resources. A <dfn>bucket policy</dfn> is attached to a bucket and names who may do what inside it, down to prefixes. A <dfn>service account</dfn> is a non-human identity (an access key pair or a role) that a system uses. <dfn>STS</dfn> (Security Token Service) issues short-lived credentials when an identity assumes a role. Ceph RGW implements a subset of STS, including AssumeRole and AssumeRoleWithWebIdentity, and SeaweedFS lists IAM and STS support.</p>
+<p>A reasonable baseline: one service account per engine and per pipeline role, each scoped to the prefixes it needs.</p>
+<div class="tw"><table><thead><tr><th>Identity</th><th>Read</th><th>Write</th></tr></thead><tbody>
+<tr><td>sa-ingest</td><td>landing</td><td>landing, bronze</td></tr>
+<tr><td>sa-transform (Spark, dbt, Prefect workers)</td><td>bronze, silver</td><td>silver, gold</td></tr>
+<tr><td>sa-mpp (StarRocks, Doris or Trino)</td><td>gold, silver</td><td>scratch</td></tr>
+<tr><td>sa-maintenance (compaction, expiry)</td><td>warehouses</td><td>warehouses (including delete)</td></tr>
+<tr><td>sa-agents (internal AI agents)</td><td>none directly; access through the engine and catalog</td><td>none</td></tr>
+</tbody></table></div>
+<pre><code class="lang-text">{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Sid": "MppReadsGold",
+    "Effect": "Allow",
+    "Principal": {"AWS": ["arn:aws:iam:::user/sa-mpp"]},
+    "Action": ["s3:GetObject", "s3:ListBucket"],
+    "Resource": ["arn:aws:s3:::lake-gold", "arn:aws:s3:::lake-gold/warehouse/*"]
+  }]
+}</code></pre>
+<p>The object store knows buckets and keys; it knows nothing about tables, columns or rows. If an engine holds a key that can read <code>lake-gold/*</code>, the store cannot stop it reading the investor table. Two consequences follow. Table, column and row rules (mask PAN numbers, restrict investor records to the fund operations team) must be enforced in the catalog and the engines. And the long-lived keys engines hold should be as narrow as possible.</p>
+<p><dfn>Credential vending</dfn> is the catalog's answer. When an engine loads a table from an Iceberg REST catalog, it can send the header <code>X-Iceberg-Access-Delegation</code> with <code>vended-credentials</code> (the catalog returns short-lived credentials scoped to that table's location) or <code>remote-signing</code> (the catalog signs each request). The engine then holds no standing access to the bucket. On-prem this needs both halves: a catalog that supports vending against S3-compatible stores, and a store that can mint scoped temporary credentials through STS. Test both in the POC, because this is where "S3-compatible" claims often fall short.</p>
+<p>For internal AI agents, the rule I would argue for: agents never get object-store credentials. They query through an engine or catalog that enforces table, column and row policies and logs every query under the agent's identity.</p>
+<p class="src">Sources: <a href="https://github.com/apache/iceberg/blob/main/open-api/rest-catalog-open-api.yaml">Iceberg REST catalog OpenAPI</a> · <a href="https://docs.ceph.com/en/latest/radosgw/STS/">Ceph RGW STS</a> · <a href="https://github.com/seaweedfs/seaweedfs">SeaweedFS README</a></p>
+
+<h3>Performance: file sizes, small files and compaction</h3>
+<p>The single biggest performance lever in a lake is file size. Working ranges practitioners use:</p>
+<ul>
+<li>Parquet data files of roughly 128 MB to 1 GB. Iceberg's Java default target is 512 MB (<code>write.target-file-size-bytes</code>), with 128 MB row groups and zstd compression by default.</li>
+<li>The Parquet project recommends large row groups of 512 MB to 1 GB, a recommendation written for HDFS block reads. Engines that prune by row-group statistics often do better with somewhat smaller row groups, which is why Iceberg's default is 128 MB.</li>
+<li>Small tables do not need large files. A daily NAV table of a few megabytes is fine as one file per day.</li>
+</ul>
+<p>The <dfn>small-file problem</dfn> is the cost of having many files far below the target. It hurts in four ways:</p>
+<ul>
+<li>Request overhead: each file costs at least a footer read and a few range GETs, each with its own latency, regardless of how few bytes it holds.</li>
+<li>Planning time: every file is one manifest entry with statistics, so the planner reads and filters more metadata.</li>
+<li>Metadata growth: frequent commits create a new metadata file, manifest list and manifest each time.</li>
+<li>Worse compression and weaker pruning: small files compress less well and their min/max ranges overlap.</li>
+</ul>
+<div class="tw"><table><thead><tr><th>1 GB of NSE ticks stored as</th><th>Footer reads</th><th>Manifest entries</th><th>Illustrative wait at 3 ms per sequential request</th></tr></thead><tbody>
+<tr><td>2 files of 512 MB</td><td>2</td><td>2</td><td>negligible</td></tr>
+<tr><td>100 files of 10 MB</td><td>100</td><td>100</td><td>0.3 s</td></tr>
+<tr><td>10,000 files of 100 KB</td><td>10,000</td><td>10,000</td><td>30 s, before reading any column data</td></tr>
+</tbody></table></div>
+<p>The 3 ms figure is an assumption for illustration; engines parallelise these requests, which shrinks the wall-clock time and moves the cost onto the store's gateways and metadata tier.</p>
+<p><dfn>Compaction</dfn> rewrites many small files into fewer large ones and commits the swap as a new snapshot. Two strategies: <dfn>bin-packing</dfn> just combines files up to the target size (cheap), while <dfn>sort</dfn> compaction also orders rows, for example by symbol and timestamp, so each file covers a narrow range of symbols and min/max statistics prune well (more CPU, much better reads). Who can run it, as of Oct 2026: Spark's <code>rewrite_data_files</code> procedure, Trino's <code>optimize</code>, StarRocks' compaction API (added in 4.0), and SeaweedFS table buckets do it server-side. PyIceberg 0.12.0 lists compaction as planned.</p>
+<pre><code class="lang-sql">-- Spark SQL: a tick table partitioned by day, sorted by symbol inside files
+CREATE TABLE lake.markets.ticks_nse (
+  symbol STRING, ts TIMESTAMP, ltp DECIMAL(12,2), qty BIGINT, exch_seq BIGINT)
+USING iceberg
+PARTITIONED BY (days(ts))
+TBLPROPERTIES (
+  'write.target-file-size-bytes' = '536870912',
+  'write.distribution-mode' = 'range',
+  'write.metadata.delete-after-commit.enabled' = 'true',
+  'write.metadata.previous-versions-max' = '50');
+ALTER TABLE lake.markets.ticks_nse WRITE ORDERED BY symbol, ts;
+
+-- After market close: compact, expire, clean up
+CALL lake.system.rewrite_data_files(table =&gt; 'markets.ticks_nse', strategy =&gt; 'sort',
+  sort_order =&gt; 'symbol ASC, ts ASC');
+CALL lake.system.expire_snapshots(table =&gt; 'markets.ticks_nse',
+  older_than =&gt; TIMESTAMP '2026-10-07 00:00:00', retain_last =&gt; 20);
+CALL lake.system.remove_orphan_files(table =&gt; 'markets.ticks_nse',
+  older_than =&gt; TIMESTAMP '2026-10-11 00:00:00');
+CALL lake.system.rewrite_manifests('markets.ticks_nse');
+
+-- Trino equivalents
+ALTER TABLE iceberg.markets.ticks_nse EXECUTE optimize(file_size_threshold =&gt; '128MB');
+ALTER TABLE iceberg.markets.ticks_nse EXECUTE expire_snapshots(retention_threshold =&gt; '7d');
+ALTER TABLE iceberg.markets.ticks_nse EXECUTE remove_orphan_files(retention_threshold =&gt; '7d');</code></pre>
+<p>Maintenance defaults worth knowing (Iceberg Java, as of Oct 2026): snapshots older than 5 days become eligible for expiry when expiry runs (<code>history.expire.max-snapshot-age-ms</code>), with at least 1 kept; orphan-file removal defaults to files older than 3 days; old metadata files are not deleted after commit by default (<code>write.metadata.delete-after-commit.enabled</code> false, <code>write.metadata.previous-versions-max</code> 100). Nothing runs by itself: someone has to schedule these jobs, which in the operating plan means Prefect flows owned by the platform team.</p>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> Two weeks after go-live, a query for one day of RELIANCE ticks takes 40 seconds and query planning alone takes most of it. The catalog's commit endpoint is slow and the metadata prefix holds thousands of files. <b>Diagnosis.</b> The feed handler commits to Iceberg every minute. The NSE normal session runs 09:15 to 15:30, which is 375 commits a day, and the table was partitioned by day and symbol, so each commit wrote one small file per active symbol: for a few hundred symbols that is tens of thousands of files a day of a few hundred KB each (illustrative). Every commit also left a metadata file, a manifest list and a manifest, and nothing expired snapshots. <b>Fix.</b> Partition by day only and sort by symbol inside files; buffer ticks and commit every 5 to 15 minutes, or keep the intraday hot path in the MPP engine's native tables and land to Iceberg in larger batches; schedule sort compaction after the close, then snapshot expiry and manifest rewrite; enable metadata cleanup after commit. <b>Lesson.</b> Commit frequency times partition count equals file count. Decide freshness per table on purpose; minute-level freshness on the lake is rarely worth what it costs.</p></aside>
+<p class="src">Sources: <a href="https://iceberg.apache.org/docs/latest/configuration/">Iceberg configuration</a> · <a href="https://iceberg.apache.org/docs/latest/maintenance/">Iceberg maintenance</a> · <a href="https://parquet.apache.org/docs/file-format/configurations/">Parquet configurations</a> · <a href="https://trino.io/docs/current/connector/iceberg.html">Trino Iceberg connector</a> · <a href="https://docs.starrocks.io/docs/introduction/Architecture/">StarRocks architecture</a> · <a href="https://py.iceberg.apache.org/api/">PyIceberg API</a> · <a href="https://docs.snowflake.com/en/user-guide/tables-clustering-micropartitions">Snowflake micro-partitions</a></p>
+
+<h3>Performance: the request path, rate limits and LIST</h3>
+<p>Engines get throughput from object storage through parallelism: many range GETs in flight across many files and connections. AWS's guidance is to spread requests over many connections and, for objects uploaded with multipart, to read in part-sized ranges aligned to part boundaries. Three settings govern it on the client side.</p>
+<ul>
+<li>A <dfn>connection pool</dfn> is the set of HTTP connections a client keeps open to the store. Each client has a maximum (in Hadoop S3A it is <code>fs.s3a.connection.maximum</code>). Too small and threads queue for connections while the network idles; too large and the gateways drown in connections.</li>
+<li>Read parallelism: how many range GETs each worker issues at once.</li>
+<li>Retries with backoff. Iceberg S3FileIO defaults to 5 retries (<code>s3.retry.num-retries</code>); its docs suggest 32 for workloads that hit throttling, so the store has time to recover.</li>
+</ul>
+<p>Rate limits differ by platform. AWS S3 supports at least 3,500 PUT/COPY/POST/DELETE and 5,500 GET/HEAD requests per second per partitioned prefix and answers bursts beyond that with HTTP 503 "Slow Down". On-prem stores have no per-prefix figure. Their limits come from gateway CPU (TLS, signatures, encoding), the metadata tier (bucket-index shards in Ceph, the filer database in SeaweedFS) and disk IOPS. The symptom is the same: rising latency, then 503s or timeouts. The store's own metrics show which tier is saturated.</p>
+<p>Avoiding LIST is the other half. A Hive-style table is discovered by listing directories, so query planning cost grows with partition count. Iceberg plans from manifests and never lists data prefixes, which is the main reason it scales on object storage.</p>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> Every morning around 09:00 the whole lake slows: dashboards time out, ingestion PUTs retry, the gateways show high CPU and the bucket-index tier is saturated, while disks are mostly idle. <b>Diagnosis.</b> A legacy Hive-style table of ticks is partitioned by date and symbol: three years of trading days times a couple of thousand symbols is over a million partition prefixes (illustrative). The morning job runs partition discovery (an <code>MSCK REPAIR TABLE</code>-style scan or a crawler), and an analyst's query without a date filter makes the engine list every partition. At 1,000 keys per page, that is a very large number of sequential LIST calls hammering the metadata tier. <b>Fix.</b> Migrate the table to Iceberg (planning from manifests), partition by day only, and replace discovery scans with explicit commits. Until then, rate-limit the discovery job and run it off-hours. <b>Lesson.</b> On object storage, LIST is the expensive verb. A design that lists at query time puts every user on one shared bottleneck.</p></aside>
+<p class="src">Sources: <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html">AWS S3 performance</a> · <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance-guidelines.html">AWS performance guidelines</a> · <a href="https://iceberg.apache.org/docs/latest/aws/">Iceberg S3FileIO retries</a> · <a href="https://hadoop.apache.org/docs/stable/hadoop-aws/tools/hadoop-aws/index.html">Hadoop S3A</a></p>
+
+<h3>Performance: caching, network and hardware</h3>
+<p>A <dfn>local cache</dfn> keeps recently read object data on the compute node's memory or NVMe so repeat reads skip the network. For a lake on object storage it is the difference between a dashboard that runs at memory speed and one that re-reads the same files from HDD every refresh.</p>
+<div class="tw"><table><thead><tr><th>Engine</th><th>Cache for object-storage data</th></tr></thead><tbody>
+<tr><td>StarRocks</td><td>Data Cache: a memory Page Cache of decompressed pages plus a disk Block Cache of file blocks on the local disks of BE (backend) or CN (stateless compute node) nodes; enabled by default since 3.3 (as of Oct 2026)</td></tr>
+<tr><td>Doris (compute-storage decoupled mode)</td><td>Shared storage holds the primary data; each BE keeps a local file cache</td></tr>
+<tr><td>ClickHouse</td><td>Filesystem cache in front of S3 disks</td></tr>
+<tr><td>Trino</td><td>File system cache per catalog (<code>fs.cache.enabled</code>), built on Alluxio libraries running inside Trino and stored on each node's local disks. Trino 482 (June 2026) removed the separate Alluxio file system (<code>fs.alluxio.enabled</code>) that let a catalog read through an external Alluxio cluster; the file system cache is unaffected</td></tr>
+</tbody></table></div>
+<p><dfn>Alluxio</dfn> is a distributed caching layer that sits between engines and storage. A shared cache tier helps when several engines read the same hot data; it is also one more stateful system to run, and since Trino 482 dropped its Alluxio file system support, check how each engine would reach a shared tier before planning one. A reasonable default (my judgement): start with each engine's local NVMe cache and add a shared tier only if measurements show repeated cross-engine reads of the same data.</p>
+<h4>Network arithmetic</h4>
+<p>Line rate converts to bytes per second by dividing by 8: 25 GbE is about 3.1 GB/s per port, 100 GbE about 12.5 GB/s. A node with one 25 GbE port can scan at most about 3 GB/s from remote storage, so scanning 1 TB takes at least about five and a half minutes on one node, and about 80 seconds across four nodes if the storage side can deliver 12 GB/s. The storage side has its own ceiling: the sum of what its disks deliver under the actual access pattern (large sequential reads of 512 MB Parquet files, or scattered small range GETs) and its gateways' network ports. The network team's leaf-spine fabric needs enough capacity between the compute racks and the storage racks for both query traffic and rebuild traffic at the same time.</p>
+<h4>Hardware shape</h4>
+<ul>
+<li>NVMe for anything metadata: Ceph's RGW index and log pools and BlueStore WAL/DB, SeaweedFS's filer database, Garage's LMDB store.</li>
+<li>HDD or high-capacity flash for bulk data in an erasure-coded pool. Datasheets for 7,200 rpm enterprise HDDs list sustained transfer rates in the low hundreds of MB/s and random reads in the low hundreds of IOPS (rule of thumb from vendor datasheets), so HDD pools need many spindles and large files.</li>
+<li>Match EC to object size: large Parquet files on EC, small objects and indexes on replicated NVMe.</li>
+<li>NVMe on the compute nodes for engine caches and spill.</li>
+</ul>
+<h4>Co-located or separate compute and storage</h4>
+<div class="tw"><table><thead><tr><th></th><th>Co-located (storage daemons on compute hosts)</th><th>Separate storage and compute nodes</th></tr></thead><tbody>
+<tr><td>Cost</td><td>Fewer servers</td><td>More servers and more network</td></tr>
+<tr><td>Interference</td><td>Rebuilds, deep scrubs and compaction compete with queries for CPU, RAM and disk</td><td>Isolated</td></tr>
+<tr><td>Scaling</td><td>Compute and storage grow together</td><td>Add compute for quarter-end or a backtest burst without touching storage</td></tr>
+<tr><td>Failure blast radius</td><td>One host loss removes a query node and storage chunks at once</td><td>Separate</td></tr>
+<tr><td>Data locality</td><td>Little in practice: S3 clients do not schedule work near the bytes</td><td>None; local caches compensate</td></tr>
+<tr><td>Fits</td><td>Labs and very small clusters</td><td>A production lake (my view)</td></tr>
+</tbody></table></div>
+<aside class="box senior"><b class="lbl">Senior lens</b><p>Most lake performance problems are layout problems (file size, partitioning, LIST) and metadata problems (bucket index, filer database, catalog), and very few are raw disk speed. So a senior engineer spends the hardware budget in a particular order: enough failure domains for the chosen EC layout, NVMe for every metadata tier, NVMe caches on compute, then network headroom for rebuilds during market hours, and only then more bulk capacity. The same engineer treats maintenance as a platform product: compaction, snapshot expiry and orphan cleanup run as owned, monitored Prefect flows with SLOs, because a lake with no owner for maintenance degrades a little every day until someone notices a 40-second query. Finally, every engine identity is attributable in the store's logs, so when the lake is slow the first question ("which engine, which job") has an answer in minutes.</p></aside>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Cache hit ratio is the first metric to read when the same dashboard is fast at 10:00 and slow at 10:05: a full cache disk or an eviction storm after a large backfill query looks like a storage problem but is a cache-sizing problem.</li>
+<li>After a node failure, rebuild traffic can take most of the storage network. Throttle recovery during market hours and let it run fast overnight.</li>
+<li>Backfills (reloading three years of ticks) are the workload that finds every limit at once: file counts, gateway CPU, catalog commits. Run them in a dedicated window, in large batches.</li>
+<li>Watch request counts per second as well as bytes per second. A store at 30% bandwidth can be saturated on requests.</li>
+</ul></aside>
+<p class="src">Sources: <a href="https://docs.starrocks.io/docs/data_source/data_cache/">StarRocks Data Cache</a> · <a href="https://doris.apache.org/docs/dev/compute-storage-decoupled/overview">Doris compute-storage decoupled</a> · <a href="https://clickhouse.com/docs/operations/storing-data">ClickHouse external storage</a> · <a href="https://trino.io/docs/current/object-storage/file-system-cache.html">Trino file system cache</a> · <a href="https://trino.io/docs/current/release/release-482.html">Trino 482 release notes (Alluxio file system removed)</a> · <a href="https://docs.ceph.com/en/latest/start/hardware-recommendations/">Ceph hardware recommendations</a></p>
+
+<h3>Benchmarking before you buy</h3>
+<p>Benchmarks answer one question: does this store, on this hardware, meet the workload with a disk and a node missing? Three tools cover the layers.</p>
+<ul>
+<li><dfn>warp</dfn> is an S3 load generator from MinIO (AGPLv3, still maintained in its own repository as of Oct 2026). It runs get, put, mixed, list, delete, multipart and versioned workloads against any S3 endpoint, and has added Iceberg catalog read and commit benchmarks (its README names MinIO AIStor Tables and Apache Polaris as the supported catalogs).</li>
+<li><dfn>fio</dfn> measures raw disk performance before any storage software is installed, which tells you what each drive can do on its own.</li>
+<li><code>weed benchmark</code> is SeaweedFS's built-in small-file write and read benchmark.</li>
+</ul>
+<pre><code class="lang-text"># Raw drives first, read-only, before installing the store
+fio --name=hdd-seq --filename=/dev/sdX --rw=read --bs=1M --iodepth=32 \
+    --ioengine=libaio --direct=1 --runtime=120 --time_based --readonly
+fio --name=nvme-rand --filename=/dev/nvme0n1 --rw=randread --bs=4k --iodepth=64 \
+    --numjobs=4 --ioengine=libaio --direct=1 --runtime=120 --time_based \
+    --group_reporting --readonly
+
+# Then the S3 layer (credentials omitted)
+warp get   --host=s3.lake.internal:443 --tls --obj.size=64MiB --concurrent=64 --duration=10m
+warp mixed --host=s3.lake.internal:443 --tls --obj.size=1MiB  --concurrent=128 --duration=10m
+warp list  --host=s3.lake.internal:443 --tls --objects=1000000 --duration=5m</code></pre>
+<div class="tw"><table><thead><tr><th>Test</th><th>How</th><th>What it tells you</th></tr></thead><tbody>
+<tr><td>Large-object read throughput</td><td>warp get, 64 to 512 MB objects</td><td>Scan speed ceiling for Parquet reads</td></tr>
+<tr><td>Small range-GET latency, p50 and p99</td><td>warp get with small objects, or the engine itself</td><td>Footer and column-chunk read cost</td></tr>
+<tr><td>Small-PUT rate</td><td>warp put with small objects</td><td>How the store copes with streaming ingest and metadata writes</td></tr>
+<tr><td>LIST on a large bucket</td><td>warp list on a bucket with millions of keys</td><td>Metadata tier health</td></tr>
+<tr><td>Degraded mode</td><td>Repeat the read tests with one disk pulled, then one node off</td><td>The number that matters during an incident</td></tr>
+<tr><td>Rebuild time and impact</td><td>Time the rebuild of a node; run queries meanwhile</td><td>How long the platform runs with reduced protection, and what users feel</td></tr>
+<tr><td>Real workload</td><td>The candidate engines running representative queries on Iceberg tables in the store</td><td>Everything synthetic tests miss</td></tr>
+</tbody></table></div>
+<aside class="box trap"><b class="lbl">Common mistake</b><p>Copying a Hive habit and partitioning tick tables by symbol as well as date. It feels natural ("queries filter by symbol"), but it multiplies files by the number of symbols, creates thousands of tiny files per day, and makes every ingest commit touch hundreds of partitions. Partition by day (Iceberg's <code>days(ts)</code> hidden partitioning) and sort by symbol inside files; min/max statistics then prune symbols nearly as well, with a few large files per day. A second common mistake is benchmarking only a healthy cluster: the first real disk failure then becomes the first degraded-mode test, during market hours.</p></aside>
+<dl class="nums">
+<dt>512 MB</dt><dd>Iceberg default target data-file size (Java, <code>write.target-file-size-bytes</code>).</dd>
+<dt>128 MB</dt><dd>Iceberg default Parquet row-group size; Parquet's own docs suggest 512 MB to 1 GB for HDFS-era reads.</dd>
+<dt>zstd</dt><dd>Iceberg default Parquet compression codec.</dd>
+<dt>5 days / 1</dt><dd>Iceberg default maximum snapshot age for expiry and minimum snapshots kept.</dd>
+<dt>3 days</dt><dd>Default age threshold for Iceberg orphan-file removal; keep it longer than your longest write.</dd>
+<dt>100, false</dt><dd>Old metadata files kept, and metadata cleanup after commit (off by default).</dd>
+<dt>4</dt><dd>Iceberg commit retries on conflict (<code>commit.retry.num-retries</code>).</dd>
+<dt>5 / 32</dt><dd>S3FileIO default retries, and the count Iceberg's docs suggest for throttled workloads.</dd>
+<dt>375</dt><dd>Minutes in the NSE normal session (09:15 to 15:30): the commit count per day of a once-a-minute writer.</dd>
+<dt>50 to 500 MB</dt><dd>Uncompressed data per Snowflake micro-partition, for comparison.</dd>
+<dt>~3.1 / ~12.5 GB/s</dt><dd>Line rate of 25 GbE and 100 GbE ports.</dd>
+<dt>~70%</dt><dd>A reasonable raw-capacity planning ceiling (rule of thumb), leaving room to rebuild after a node failure.</dd>
+</dl>
+<aside class="box say"><b class="lbl">Say this</b><p>"I would set the lake up with a few buckets by zone and sensitivity: landing for files exactly as received, bronze, silver and gold as Iceberg warehouses, a separate WORM bucket for records we must retain, a restricted warehouse for investor data, and scratch and log buckets with short expiry. Each engine gets its own service account scoped to the prefixes it needs, and ideally the catalog vends short-lived credentials so engines hold no standing keys; AI agents query through the engine and hold no store credentials. On performance, the main lever is file layout: around 512 MB files, which is Iceberg's default, partition ticks by day and sort by symbol, and compact after the close, because a once-a-minute ingest otherwise creates tens of thousands of small files a day. Reads plan from Iceberg metadata with no LIST calls, and each engine gets a local NVMe cache. The traps I would guard against are lifecycle rules or orphan cleanup deleting files a live table still references, and versioning quietly doubling storage. I have not operated this on-prem; this is how I would design it and what I would monitor."</p></aside>
+<p class="src">Sources: <a href="https://github.com/minio/warp">warp</a> · <a href="https://github.com/seaweedfs/seaweedfs">SeaweedFS</a> · <a href="https://iceberg.apache.org/docs/latest/configuration/">Iceberg configuration</a> · <a href="https://iceberg.apache.org/docs/latest/maintenance/">Iceberg maintenance</a> · <a href="https://iceberg.apache.org/docs/latest/aws/">Iceberg S3FileIO</a></p>
+</section>

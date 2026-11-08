@@ -1,0 +1,272 @@
+[
+ {
+  "id": "B2-01",
+  "topic": "compression",
+  "q": "Which compression would you use for our tick data, and how would you decide?",
+  "mid": "I separate encoding from compression: dictionary for symbols, delta for timestamps and sequence numbers, then a general codec on top. For hot, cached data I would use LZ4 or ZSTD level 1, for lake data read over the network ZSTD at a low level, and for cold history a higher ZSTD level. I would also store prices as scaled integers or decimals so they compress well.",
+  "senior": "The choice follows the bottleneck. If scans are bound by object-store or network reads, a stronger codec cuts the bytes moved and wins; if data is cached and CPU is the limit, a lighter codec wins. The zstd authors note decompression speed stays roughly the same at every level, so higher levels mainly cost writers and merges, which is why I would ingest at ZSTD(1) or LZ4 and recompress cold partitions later (ClickHouse TTL RECOMPRESS or lake compaction). On-prem the ratio also sets the disk purchase together with replica count, so I would benchmark one real week of ticks across three codecs, cold and warm cache, before fixing table templates.",
+  "followups": [
+   {
+    "q": "What are the defaults in ClickHouse, StarRocks and Doris?",
+    "a": "ClickHouse self-managed uses LZ4 with per-column CODEC overrides; StarRocks uses LZ4, set per table at CREATE TABLE and not changeable later, with zstd(level) since 3.3.2; Doris 4.x uses ZSTD from the FE config default_compression_type (the 3.1 branch used LZ4F). Iceberg writes Parquet with zstd by default (as of Oct 2026)."
+   },
+   {
+    "q": "Why does a high ZSTD level hurt ingest but barely affect queries?",
+    "a": "Compression time rises steeply with the level while decompression speed stays about flat, so the cost lands on writers and merges. At market open that can push ClickHouse towards its 1,000-part insert delay threshold."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B2-02",
+  "topic": "file-formats",
+  "q": "Walk me through how a query engine skips data in a Parquet and Iceberg based lake.",
+  "mid": "Parquet splits a file into row groups, column chunks and pages, and the footer keeps min, max and null counts per column chunk. The engine reads only the columns it needs, uses footer stats to skip row groups, an optional page index to skip pages, and dictionaries or Bloom filters for exact values. Iceberg adds partition pruning and per-file column bounds in manifests, so whole files are dropped before they are opened.",
+  "senior": "Every stats-based step depends on clustering: ticks written in arrival order give every file the full symbol range, so nothing is pruned, which makes sort order part of schema design. Iceberg collects file metrics for only the first 100 columns by default and truncates string bounds to 16 characters, so wide generated tables can silently lose pruning. I would verify with query profiles (files and row groups scanned against rows returned) and keep files near the 512 MB Iceberg target, because each file costs footer reads and planning work.",
+  "followups": [
+   {
+    "q": "What is a Parquet page index and when does it help?",
+    "a": "Optional ColumnIndex and OffsetIndex structures holding min, max and offsets per page, so a reader can jump to matching pages inside a column chunk. It helps range filters on the sort column and selective lookups."
+   },
+   {
+    "q": "When would you add a Bloom filter?",
+    "a": "For equality lookups on high-cardinality columns such as an ISIN or order ID, where min/max ranges are too wide to exclude anything. Iceberg leaves them off by default; enable per column with write.parquet.bloom-filter-enabled.column.<name>."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B2-03",
+  "topic": "encryption",
+  "q": "How would you implement encryption at rest and in transit for our on-prem lake and MPP cluster?",
+  "mid": "LUKS on every data disk, server-side encryption on the object store with keys in a KMS such as OpenBao or Vault, and TLS on every connection including engine to object store, with mutual TLS between services. For a short list of PII columns in investor records I would add Parquet column-level encryption.",
+  "senior": "I would anchor it to a threat model: LUKS covers drives leaving the colo, SSE-KMS covers raw access on storage nodes, Parquet or Iceberg encryption covers storage admins, TLS covers network taps, and none of them stops a caller with valid credentials. Iceberg table encryption is currently Java-only with Hive or REST catalogs and ships KMS clients for AWS, GCP and Azure only, so on-prem it needs a custom KMS client and narrows the engine set; I would put it in a later phase after a proof of concept. Once data is encrypted the KMS is on every read path, so it needs 3 or 5 nodes across failure domains and a drilled unseal procedure.",
+  "followups": [
+   {
+    "q": "Is TLS inside a private colo rack really needed?",
+    "a": "In my view yes: colo networks are shared infrastructure, mirror ports and compromised switches happen, and the engine to object store hop carries all the data and often credentials. With AES instructions the CPU cost is small; the real work is certificate automation and expiry monitoring."
+   },
+   {
+    "q": "What does server-side encryption not protect against?",
+    "a": "Anyone holding a valid S3 credential, because the store decrypts for them, and store administrators who are allowed to use the KMS key."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B2-04",
+  "topic": "encryption",
+  "q": "Explain envelope encryption. How would you rotate keys without rewriting 40 TB?",
+  "mid": "Each file is encrypted with its own random data encryption key (DEK), and the DEK is wrapped by a master key (KEK) that never leaves the KMS; the wrapped DEK is stored with the file or table metadata. Readers ask the KMS to unwrap it. Rotating the KEK only requires re-wrapping the small DEKs, so the data is untouched.",
+  "senior": "I would separate KEK rotation (new version, rewrap, data untouched), DEK rotation (rewrite files, which in Iceberg means a rewrite job) and credential rotation. With Vault or OpenBao Transit the runbook is rotate, rewrap every wrapped DEK that live data, snapshots and backups reference, verify the oldest retained snapshot still reads, and only then raise min_decryption_version; trimming an old version is irreversible. Separation of duties matters as much: key custodians apart from platform admins, two people for destructive key operations, and a reviewed KMS audit log.",
+  "followups": [
+   {
+    "q": "What breaks if you retire the old key version too early?",
+    "a": "Older snapshots, time travel and backups that still reference DEKs wrapped under that version stop decrypting. If it was only archived with min_decryption_version you can move it back; if it was trimmed, that data is gone."
+   },
+   {
+    "q": "Where does Iceberg keep the keys?",
+    "a": "Each data file's key and AAD prefix (a per-file identifier used as additional authenticated data) sit in its manifest's key_metadata, each manifest's key sits in the manifest list, and the manifest list's key metadata is encrypted with a KEK and kept in table metadata."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B2-05",
+  "topic": "compression",
+  "q": "What is the difference between encoding and compression, and which encodings matter for financial time series?",
+  "mid": "Encoding is a type-aware transform such as dictionary, run-length or delta; compression is a general byte-level codec such as LZ4 or ZSTD applied after encoding. For market data: dictionary for symbols and books, delta or delta-of-delta for timestamps and sequence numbers, and for floats BYTE_STREAM_SPLIT in Parquet or Gorilla and FPC in ClickHouse.",
+  "senior": "Engines can filter on encoded data, for example comparing dictionary codes, so encoding saves CPU as well as bytes. I watch for dictionary fallback: once a chunk's dictionary passes 1 MB in parquet-java or 2 MB in Iceberg, the writer switches to PLAIN for the rest of the chunk, which typically happens on order IDs. Writers decide encodings and many use the DELTA encodings only in a v2 mode, so I check parquet_metadata output instead of assuming; and sorting by symbol and time is what creates the runs and small deltas.",
+  "followups": [
+   {
+    "q": "What do ClickHouse Delta and GCD have in common?",
+    "a": "Both are preparation codecs that transform values and cannot be used alone; you chain them with LZ4 or ZSTD, for example CODEC(GCD, Delta, ZSTD(1)) for prices in paise that move in tick-size steps."
+   },
+   {
+    "q": "Why does BYTE_STREAM_SPLIT help floats if it does not shrink data by itself?",
+    "a": "It groups the same byte position of every value together, so sign, exponent and high mantissa bytes, which change slowly, form repetitive streams that the codec compresses well."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B2-06",
+  "topic": "file-formats",
+  "q": "Why does sort order inside files matter, and how would you lay out tick, position and loan data?",
+  "mid": "Sorting clusters similar values, so min/max stats exclude more data, and it creates runs for run-length encoding and small differences for delta encoding. Ticks: partition by day, sort by underlying, expiry, strike and time. Positions: partition by as-of date, sort by fund, book and instrument. Loan cash flows: sort by deal, loan and payment date.",
+  "senior": "There is one physical order per copy, so I pick it from the dominant filters and consider z-ordering when two filters matter equally. Sorting costs memory and a shuffle at write time, so streaming data lands in arrival order and the sort happens in compaction; bin-pack compaction fixes file counts but can destroy clustering, so entity-filtered tables need the sort strategy. The native engines have the same idea in ClickHouse ORDER BY and StarRocks or Doris sort keys, and the lake copy and engine copy can be sorted for different query patterns.",
+  "followups": [
+   {
+    "q": "Why not partition tick data by symbol?",
+    "a": "Thousands of symbols times days gives tiny files and heavy metadata, and writers hold one open file per partition, which drives memory. Partition by time and sort by entity."
+   },
+   {
+    "q": "How do you declare a sort order on an Iceberg table?",
+    "a": "In Spark with ALTER TABLE ... WRITE ORDERED BY, in Trino with the sorted_by table property, and for existing files with rewrite_data_files using the sort strategy."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B2-07",
+  "topic": "file-formats",
+  "q": "Streaming ingestion is producing thousands of tiny files. What goes wrong and how do you fix it?",
+  "mid": "Every commit closes the open files, so frequent commits create small files with tiny row groups. That weakens compression, multiplies object-store requests and slows planning as manifests and snapshots pile up. The fixes are less frequent commits, scheduled compaction and snapshot expiry.",
+  "senior": "The arithmetic makes the case: a 375-minute NSE session with per-minute commits from 4 writer tasks is 1,500 files and 375 snapshots a day for one table. I would keep real-time ticks in the MPP engine's native tables and write the lake in larger batches, run nightly sort compaction with Spark rewrite_data_files or Trino optimize (PyIceberg 0.12 has no compaction), expire snapshots on an agreed retention, and alert on average file size. Compaction is a production job with an owner: it conflicts with concurrent deletes, needs retries and should run away from end-of-day loads.",
+  "followups": [
+   {
+    "q": "How would you detect the problem?",
+    "a": "Query the Iceberg files and snapshots metadata tables for file count and average size per partition; in ClickHouse, compare active parts per partition with the 1,000-part insert delay threshold."
+   },
+   {
+    "q": "Why does writer memory blow up when writing many partitions?",
+    "a": "Each open file buffers a row group (128 MB target by default) before flushing, so memory scales with open partitions times row group size. Repartition by the partition key before writing."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B2-08",
+  "topic": "encryption",
+  "q": "We will give AI agents access to our data. Does encryption protect us, and what else is needed?",
+  "mid": "Encryption at rest and in transit does not stop an agent that holds valid credentials, because the system decrypts for any authorised caller. Agents need their own identities, role-based access, column masking for PII, row policies by desk or fund, query limits and audit logs.",
+  "senior": "I would make every agent request carry the agent id and the on-behalf-of user, enforced at one connection layer and logged to a store the platform team cannot edit, with a daily check for untagged queries. The catalog can scope table access and storage credentials, the engine applies masking and row policies, and workload groups keep agents from starving the overnight risk run. On compliance, SEBI's CSCRF applies to AIFs and mutual funds, and SEBI's February 2025 amendments make registered intermediaries and market infrastructure institutions that use AI tools solely responsible for the output and for the investor data used, so audit trails are effectively a requirement.",
+  "followups": [
+   {
+    "q": "Where should masking be enforced: engine, catalog or the agent's tools?",
+    "a": "In the engine or policy layer closest to the data, so every client gets it, with the tool layer adding row limits and column allow-lists as a second line."
+   },
+   {
+    "q": "Would deterministic encryption of PAN numbers let agents join safely?",
+    "a": "It allows equality joins but leaks which rows share a value. For agents I would prefer tokenised keys or masked views, with the unmasking role held by very few people."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B2-09",
+  "topic": "encryption",
+  "q": "Why compress before encrypting, and what does encryption really cost?",
+  "mid": "Encrypted output looks like random bytes, so compressing afterwards removes nothing. The order is encode, compress, then encrypt, which Parquet does per page and ClickHouse requires for its encryption codecs. With AES hardware instructions the CPU cost is usually modest.",
+  "senior": "The larger costs are operational. Every read needs a key unwrap, so a KMS outage blocks reads, and a query touching 20,000 files may need 20,000 unwraps unless data keys are cached with a time limit. Compatibility narrows: encrypted Parquet footers lock out readers without encryption support, and Iceberg encryption is Java-only today. I would measure AES throughput on the real servers with openssl speed, and I would mention CRIME and BREACH as the reason compression next to secrets and attacker input can leak, which is why TLS 1.3 dropped compression.",
+  "followups": [
+   {
+    "q": "AES-GCM or AES-CTR?",
+    "a": "GCM authenticates and detects tampering; CTR is faster but unauthenticated. Parquet's AES_GCM_CTR_V1 uses CTR for data pages and GCM for metadata, and ClickHouse's encrypted disk defaults to AES_128_CTR."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B2-10",
+  "topic": "file-formats",
+  "q": "Parquet, ORC and Avro: where does each fit in our platform?",
+  "mid": "Parquet for all curated analytical tables, because every engine on the shortlist reads it and it carries rich skipping metadata. Avro for row-at-a-time streams and schema evolution, and Iceberg already uses it for manifests. ORC only if inherited from a Hive estate, and CSV or JSON only in the raw landing zone.",
+  "senior": "Writer support differs: StarRocks writes Iceberg tables in Parquet only, so ORC would limit engine choice. Avro's reader and writer schema resolution suits Kafka with a schema registry if the team adopts streaming. I would keep raw vendor files (loan tapes, registrar files, exchange EOD files) unchanged for audit and convert them at ingest with an explicit schema and validation, so types cannot drift between vendor versions.",
+  "followups": [
+   {
+    "q": "Why not query the CSV landing files directly?",
+    "a": "They have no types, no statistics and no column pruning, and gzip CSVs cannot be split, so every query re-parses every file."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "B2-11",
+  "topic": "compression",
+  "q": "What are the compression defaults in ClickHouse, StarRocks and Doris, and how do you change them?",
+  "mid": "ClickHouse self-managed defaults to LZ4 and lets you set CODEC per column. StarRocks defaults to LZ4 with a compression table property. Doris 4.x defaults to ZSTD and uses the same property name.",
+  "senior": "StarRocks fixes compression at CREATE TABLE and cannot change it later, with zstd(level) available since 3.3.2 and level 3 as default, so table templates matter. In ClickHouse, MODIFY COLUMN CODEC affects new parts only, old parts change on merge, and TTL RECOMPRESS can move cold parts to heavier codecs. Doris pages disagree (older docs say LZ4F, the 4.x FE config default_compression_type is ZSTD), so I would check SHOW CREATE TABLE; on the lake side Iceberg Java and PyIceberg write zstd, plain Spark Parquet uses snappy and DuckDB snappy (as of Oct 2026).",
+  "followups": [
+   {
+    "q": "How do you see per-column compression in ClickHouse?",
+    "a": "Query system.columns for data_compressed_bytes, data_uncompressed_bytes and compression_codec per column, and sort by compressed bytes to find the expensive columns."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B2-12",
+  "topic": "encryption",
+  "q": "What does Iceberg table encryption encrypt, what stays in clear, and what are its limitations?",
+  "mid": "It encrypts data files, delete files, manifests and manifest lists with per-file keys, using Parquet modular encryption for Parquet and AES GCM streams for Avro and metadata files. metadata.json is not encrypted because it holds no data or statistics. It needs a KMS configured on the catalog and the table property encryption.key-id.",
+  "senior": "As of Oct 2026 it is a Java feature that works with Hive and REST catalogs and Parquet or Avro files; release 1.11 added built-in KMS envelope encryption and manifest-list encryption, and the shipped KMS clients cover AWS, GCP and Azure only, so Vault or OpenBao needs a custom KeyManagementClient implementing wrapKey and unwrapKey. Catalogs must stop anyone changing the key-id property and must protect metadata.json integrity. Trino 483 (July 2026) can read encrypted Parquet Iceberg tables but only with the AWS, Azure or GCP KMS types and cannot write them, and I have not seen documentation that StarRocks, Doris, ClickHouse or DuckDB read them, so on-prem it narrows the engine set, and I would prove it in a proof of concept before committing.",
+  "followups": [
+   {
+    "q": "How can you check that a file is really encrypted?",
+    "a": "Look at the first bytes with hexdump: encrypted-footer Parquet files start with PARE, and encrypted manifests and manifest lists start with AGS1."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B2-13",
+  "topic": "compression",
+  "q": "How does compression feed into storage sizing for roughly 40 TB on-prem?",
+  "mid": "Total storage is raw size times replica count divided by compression ratio, plus headroom. The StarRocks planning guide uses this formula and quotes ratios of 3:1 to 5:1.",
+  "senior": "At 40 TB raw with 3 replicas, a 4:1 ratio needs 30 TB of disk and a 6:1 ratio needs 20 TB, so the ratio moves the purchase by a third; I would measure it on a real week of data before ordering hardware. Shared-data designs with erasure coding change the replica multiplier, and documents such as loan PDFs barely compress, so I would size them separately. CPU is bought up front as well, and heavier codecs spend it on every write and merge.",
+  "followups": [
+   {
+    "q": "Do the structured-credit PDFs compress?",
+    "a": "Usually very little, because PDFs are mostly compressed internally already. Store them as-is in the object store and compress only the extracted text and fields."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B2-14",
+  "topic": "file-formats",
+  "q": "What row group size, page size and target file size would you choose, and why?",
+  "mid": "I would start with the Iceberg defaults: 128 MB row groups, 1 MB pages with a 20,000-row limit, 2 MB dictionary pages and 512 MB target files, and tune only after profiling shows a reason.",
+  "senior": "Bigger row groups compress better and need fewer requests but cost writer memory and give coarser skipping; tiny ones from streaming writers multiply requests and metadata. The Parquet docs' advice of 512 MB to 1 GB row groups and 8 KB pages comes from HDFS days. Defaults differ across writers (PyIceberg limits row groups to 1,048,576 rows, DuckDB to 122,880 rows, and plain parquet-java writes uncompressed), so I would route Spark, PyIceberg and DuckDB writes through one writer library with shared settings.",
+  "followups": [
+   {
+    "q": "What does a too-small dictionary page size cause?",
+    "a": "Early fallback to PLAIN encoding for the rest of the column chunk, so moderate-cardinality columns lose dictionary compression and dictionary-based filtering."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B2-15",
+  "topic": "encryption",
+  "q": "What happens if the KMS goes down, and how do you design for it?",
+  "mid": "Readers can no longer unwrap data keys, so encrypted tables and SSE-KMS objects become unreadable once cached keys expire. The KMS has to run as a highly available cluster and be monitored like a database.",
+  "senior": "Vault and OpenBao start sealed after a restart, so a colo power event can bring everything back except decryption; that calls for an auto-unseal mechanism where the edition supports it, a drilled unseal runbook with named custodians, startup ordering, and data-key caching with sensible TTLs to ride out short blips. I would run 3 or 5 Raft nodes across failure domains and back up the KMS storage itself, because losing it loses every encrypted file. It is a tier-0 dependency on the read path.",
+  "followups": [
+   {
+    "q": "What is the worst case?",
+    "a": "Losing the KMS data or master keys without a usable backup: every encrypted file becomes permanently unreadable. Key backups need restore drills like database backups."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B2-16",
+  "topic": "encryption",
+  "q": "SSE-S3, SSE-KMS or SSE-C on a self-hosted object store: which would you choose and why?",
+  "mid": "SSE-KMS: the store encrypts each object with a data key wrapped by a key in an external KMS, which gives key policies, audit and separation of duties. SSE-S3 is simpler but the store holds its own keys, and SSE-C makes every client send the key with every request.",
+  "senior": "Ceph's object gateway implements SSE-KMS with Vault, KMIP or Barbican and SSE-S3 only with Vault, and SeaweedFS has an encryptVolumeData flag; the MinIO community edition is archived, so I would not plan around its KMS integration. AWS turned SSE-C off by default for new general purpose buckets in April 2026, saying most modern use cases have moved to SSE-S3 or SSE-KMS; per-request keys are also hard to share safely. SSE only covers raw-volume and disk access: a valid S3 credential still reads plaintext, so credential hygiene and bucket policies carry the rest.",
+  "followups": [
+   {
+    "q": "Any performance concern?",
+    "a": "Per-object key fetches add KMS load. Ceph's development docs (for the release after Tentacle) describe a KMS secret cache with separate TTLs for hits, misses and transient errors, and on AWS S3 Bucket Keys exist to cut KMS calls."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "B2-17",
+  "topic": "compression",
+  "q": "A price column compresses at about 1.3:1 while the rest of the table compresses several times better. How do you diagnose and fix it?",
+  "mid": "Check its type, encoding and codec with system.columns in ClickHouse or parquet_metadata for Parquet. The usual cause is a DOUBLE with noisy mantissa bits. Store it as a decimal or scaled integer and add a delta or GCD step before ZSTD.",
+  "senior": "Trade prices jump between bid and ask, so XOR-based Gorilla is weak there, while scaled integers in paise with GCD capture tick-size steps. Sort order matters too: unsorted, consecutive prices belong to different instruments. Genuinely continuous floats such as Greeks stay as doubles with BYTE_STREAM_SPLIT or FPC, measured, and fixed-point for money is right for correctness as well as size.",
+  "followups": [
+   {
+    "q": "How would you prove the fix worked?",
+    "a": "Rewrite one week into a test table with the new type and codecs, then compare compressed bytes per column and query latency with cold and warm caches."
+   }
+  ],
+  "level": "deep"
+ }
+]

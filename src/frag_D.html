@@ -1,0 +1,581 @@
+<section class="topic" id="design">
+<h2>The whiteboard: design a self-hosted lakehouse</h2>
+<p class="lede">This is the question most likely to take half of a design interview: "Design a self-hosted lakehouse and analytical database platform, under 40 TB, so AI agents can later get governed access." The interviewer wants to see you ask the right questions, draw clear layers, pick each component for a reason you can defend, name the runner-up, and say what you would build first. This section walks the answer in the order you would speak it at the whiteboard.</p>
+
+<h3>How the interviewer runs this question</h3>
+<p>A <dfn>system design interview</dfn> is an open question where you sketch an architecture and the interviewer pushes on your choices. For a senior architect or a CTO, the scoring usually rests on five things: did you clarify requirements before drawing, are the layers clean, can you explain each trade-off, do you think about running it on day 2 (the long period after launch), and do you keep security and compliance in view. Nobody expects one correct answer.</p>
+<p>A time plan that works for a 45 to 60 minute slot (my suggestion):</p>
+<ol>
+<li><b>Clarify, 5 minutes.</b> Ask the questions in the next subsection and write the answers in a corner of the board.</li>
+<li><b>Draw the layers, 10 minutes.</b> Sources, ingestion, storage, tables, engines, consumers, governance, observability.</li>
+<li><b>Choose components, 15 minutes.</b> One pick and one runner-up per layer, with the reason and what would flip the decision.</li>
+<li><b>Day 2 and failures, 10 minutes.</b> What you monitor, what breaks first, backup and disaster recovery.</li>
+<li><b>First 90 days, 5 minutes.</b> What you build first and how you prove it works.</li>
+</ol>
+<p>A few terms first, so the rest reads cleanly. A <dfn>data lake</dfn> is a store of files (here, on object storage) that many tools can read. A <dfn>table format</dfn> is a set of rules for metadata files that turns a pile of data files into a table with a schema, versions and atomic commits. <dfn>Apache Iceberg</dfn> is the table format on the shortlist. A <dfn>lakehouse</dfn> is the combination: open files on object storage, a table format on top, and one or more query engines that read the same tables. The 2021 CIDR paper that set out the idea argues that this removes the separate copy most firms keep in a warehouse. An <dfn>MPP database</dfn> (massively parallel processing) runs one query on many nodes at once; Redshift and Snowflake are MPP systems you have used, and ClickHouse, Doris and StarRocks are the self-hosted ones on the shortlist.</p>
+<p class="src">Sources: <a href="https://www.cidrdb.org/cidr2021/papers/cidr2021_paper17.pdf">Lakehouse, CIDR 2021</a></p>
+
+<h3>Step 1: the clarifying questions to ask first</h3>
+<p>Ask these before drawing anything. Each answer changes a concrete number or component, and the table says which.</p>
+<div class="tw"><table><thead><tr><th>Question</th><th>Why it matters</th><th>What the answer changes</th></tr></thead><tbody>
+<tr><td>Is "under 40 TB" the raw size in source systems, the compressed size on disk, or the size with copies?</td><td>The three readings differ by a factor of 3 to 10.</td><td>Disk count, node count, budget.</td></tr>
+<tr><td>Which workloads, at what latency? Morning PM dashboards, the overnight risk batch, research backtests, intraday views?</td><td>Interactive dashboards need seconds at high concurrency; batch needs throughput.</td><td>Engine choice, cache size, number of compute groups.</td></tr>
+<tr><td>How fresh must data be? End of day only, every 15 minutes, or tick by tick during market hours?</td><td>Sub-minute freshness pushes you toward a streaming bus such as Kafka.</td><td>Ingestion design, small-file pressure, compaction schedule.</td></tr>
+<tr><td>Who writes and who reads? How many teams, how many analysts with SQL?</td><td>Many writers to the same tables means commit conflicts and stricter contracts.</td><td>Catalog permissions, namespace layout, on-call load.</td></tr>
+<tr><td>What do compliance and retention require? Years of retention, immutable copies, data residency in India, SEBI cyber-security rules?</td><td>Immutable (WORM, write once read many) storage and long retention multiply capacity.</td><td>Object lock, bucket layout, encryption keys, DR (disaster recovery) site.</td></tr>
+<tr><td>What are the RPO and RTO, and is there a second site?</td><td><dfn>RPO</dfn> (recovery point objective) is how much recent data you may lose; <dfn>RTO</dfn> (recovery time objective) is how long you may be down.</td><td>Replication mode, backup cadence, DR hardware.</td></tr>
+<tr><td>How big is the platform team, and who carries the pager?</td><td>Ceph, an MPP engine, Postgres and Kubernetes each need operating skill.</td><td>How many distinct systems you can afford to run; whether to buy support.</td></tr>
+<tr><td>What exists today? OMS or PMS (order and portfolio management systems), current databases, vendor feeds, spreadsheets?</td><td>Migration and coexistence shape the first year.</td><td>Connectors, the order of pipelines, cut-over plan.</td></tr>
+<tr><td>What will the AI agents do first? Read-only questions over curated data, or actions?</td><td>Write access by agents is a different risk class.</td><td>Gateway design, permissions, audit depth.</td></tr>
+<tr><td>Budget, hardware lead time, appetite for paid support?</td><td>Colo hardware can take weeks or months to arrive and fit out; ask the vendor for real lead times.</td><td>Phasing, spare parts, which open-source projects you can rely on.</td></tr>
+</tbody></table></div>
+<p>Then state your working assumptions out loud, so the interviewer can correct them. The ones used on this page: 40 TB is today's logical, uncompressed data including history and documents; end-of-day data plus intraday ticks with minutes of delay is acceptable; tens of concurrent dashboard users at the 09:15 open, rising when agents arrive; a platform team of three to five people; data residency requirements apply; a second colo exists or will exist for disaster recovery; retention is long (confirm the number with compliance).</p>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Interviewers often leave numbers vague on purpose. Asking what "40 TB" measures scores more than any engine name you say.</li>
+<li>Teams that build this kind of platform usually find that most of the first six months goes into ingestion contracts and data quality. The engine is rarely the bottleneck at this size (my judgement, from how such projects are typically described).</li>
+<li>Ask about trading hours early. NSE cash and F&amp;O (futures and options) trade 09:15 to 15:30 IST, and MCX non-agricultural contracts trade until 23:30 or 23:55 IST depending on US daylight saving. That leaves a short weekday maintenance window between midnight and the pre-open.</li>
+<li>"Data stays with us" usually also means "logs and telemetry stay with us". Ask before proposing any hosted monitoring tool.</li>
+</ul></aside>
+<p class="src">Sources: <a href="https://www.icicidirect.com/ilearn/commodity/articles/mcx-revision-in-trading-hours-from-march-09-2026">MCX trading hours revision (broker summary)</a></p>
+
+<h3>Step 2: draw the layers</h3>
+<p>Draw the picture before naming products. Each box below is a role; the product choices come next.</p>
+<pre class="mermaid">flowchart LR
+  SRC["Sources: NSE BSE MCX feeds, OMS and PMS, loan tapes, PDFs"] --> PF["Prefect flows on workers"]
+  PF --> OS["Object store: landing, silver, gold buckets"]
+  PF --> CAT["Iceberg REST catalog"]
+  BAT["Batch compute: Spark or PyIceberg jobs"] --> CAT
+  BAT --> OS
+  CAT --> PG["Postgres HA for catalog and Prefect state"]
+  ENG["Serving engine: StarRocks shared-data"] --> CAT
+  ENG --> OS
+  BI["PM dashboards, risk, NAV reports"] --> ENG
+  AG["internal AI agents agents"] --> GW["Agent gateway: MCP tools over curated views"]
+  GW --> ENG
+  OBS["Prometheus, Grafana, OpenSearch"] -.-> ENG
+</pre>
+<p>Walk it left to right:</p>
+<ul>
+<li><b>Sources.</b> Exchange and vendor market data (ticks, quotes, end-of-day prices, corporate actions), the order and portfolio management systems that hold trades and positions, risk outputs, structured-credit loan tapes and cash-flow files, PDFs such as loan agreements and trustee reports, toll-road operator reports, and later the mutual fund's daily NAV (net asset value) inputs and investor records.</li>
+<li><b>Ingestion and orchestration.</b> Prefect flows pull or receive each source, land the raw file unchanged, validate it, and write typed Iceberg tables.</li>
+<li><b>Object store.</b> One S3-compatible store holds everything: raw files in a landing bucket, cleaned tables in silver, business-ready tables in gold. An <dfn>S3-compatible store</dfn> is a server that speaks the Amazon S3 HTTP API, so every engine that reads S3 can read it.</li>
+<li><b>Catalog.</b> An <dfn>Iceberg catalog</dfn> stores, for each table, a pointer to the table's current metadata file. A <dfn>REST catalog</dfn> is a catalog that engines reach through the HTTP API defined by the Iceberg project's OpenAPI file, so any engine that speaks it can use any catalog that implements it. Its own state lives in Postgres.</li>
+<li><b>Engines.</b> A serving engine answers dashboards and agents fast. Batch compute (Spark, or PyIceberg and DuckDB for small jobs) runs transformations and table maintenance.</li>
+<li><b>Consumers.</b> PM dashboards, the risk team, fund accounting for NAV, research.</li>
+<li><b>Governance and agents.</b> Agents never get raw storage credentials. They call a gateway that exposes a small set of tools over curated views, under their own identity, with every call audited.</li>
+<li><b>Observability.</b> Metrics, logs and alerts for every layer, on infrastructure the team controls.</li>
+</ul>
+<p>Two more definitions you will use constantly. A <dfn>snapshot</dfn> in Iceberg is the complete state of a table after one commit; old snapshots enable time travel ("show me positions as they were at 18:00 yesterday") until they are expired. <dfn>Compaction</dfn> is the background job that rewrites many small data files into fewer large ones so queries open fewer files.</p>
+<p class="src">Sources: <a href="https://iceberg.apache.org/spec/">Iceberg spec</a> · <a href="https://github.com/apache/iceberg">Iceberg repo (open-api/rest-catalog-open-api.yaml)</a></p>
+
+<h3>Step 3: component choices, each with a runner-up</h3>
+<p>Say the pick, the reason, the runner-up, and what would flip the decision. Interviewers push hardest on the last column, because it shows you know the pick is conditional.</p>
+<div class="tw"><table><thead><tr><th>Layer</th><th>My pick</th><th>Runner-up</th><th>Why the pick</th><th>What would flip it</th></tr></thead><tbody>
+<tr><td>Object store</td><td>Ceph RGW (Ceph's S3 gateway), erasure coded 4+2</td><td>SeaweedFS</td><td>Most mature self-hosted S3; erasure coding, multisite replication, STS (Security Token Service, which issues short-lived credentials), object lock; large operator base; paid support exists</td><td>No Ceph skills and no budget for support: SeaweedFS is simpler to run</td></tr>
+<tr><td>Table format</td><td>Iceberg, format v2</td><td>Delta Lake or Apache Paimon</td><td>Standard REST catalog API; read and write support on every engine on the shortlist</td><td>A streaming-upsert-heavy design could favour Paimon</td></tr>
+<tr><td>Catalog</td><td>Apache Polaris</td><td>Lakekeeper</td><td>Apache governance; role-based access control with credential vending; Postgres persistence; StarRocks integration documented</td><td>If the store lacks STS or you want finer-grained authorisation: Lakekeeper (remote signing, OpenFGA, an open-source fine-grained authorisation service)</td></tr>
+<tr><td>Serving engine</td><td>StarRocks, shared-data mode</td><td>Apache Doris, decoupled mode</td><td>Only two node types (FE frontends and CN compute nodes, defined below), no extra metadata system; fast Iceberg reads with local cache; row and column policies through Apache Ranger, an open-source policy service</td><td>Need UPDATE, DELETE and MERGE on Iceberg from the engine, or documented compute groups in your exact build: Doris</td></tr>
+<tr><td>Batch and maintenance</td><td>Spark on Kubernetes, plus PyIceberg and DuckDB for small jobs</td><td>Trino</td><td>Iceberg's maintenance procedures are most complete in Spark; PyIceberg 0.12 has no compaction yet</td><td>If the team prefers SQL-only operations: Trino's optimize and expire_snapshots</td></tr>
+<tr><td>Orchestration</td><td>Prefect 3</td><td>Apache Airflow</td><td>if the team already runs it; plain Python flows; small self-hosted footprint</td><td>A large existing Airflow estate or a need for Airflow's operator catalogue</td></tr>
+<tr><td>Ingestion</td><td>Prefect micro-batches into landing files, then Iceberg appends</td><td>Kafka plus a sink connector</td><td>Fewer systems to run at this size; minutes of delay is enough</td><td>Sub-second intraday risk or many streaming consumers</td></tr>
+<tr><td>Agent access</td><td>MCP (Model Context Protocol, defined in the governance section) gateway over curated gold views</td><td>Per-agent SQL roles straight on the engine</td><td>Narrow, auditable tool surface; easy to rate-limit</td><td>Power users who need ad-hoc SQL get a separate, tightly scoped role</td></tr>
+<tr><td>Observability</td><td>Prometheus, Grafana, OpenSearch</td><td>A hosted monitoring service</td><td>Self-hosted, matches "data stays with us"</td><td>Only if compliance allows telemetry to leave</td></tr>
+</tbody></table></div>
+<p>The rest of this section explains each pick in enough depth to survive three follow-ups.</p>
+
+<h3>The object store, now that MinIO's community edition is archived</h3>
+<p>Most self-hosted lakehouse tutorials from 2022 to 2025 used MinIO, so the interviewer may expect it. Know what changed.</p>
+<aside class="box asof"><b class="lbl">As of Oct 2026</b><p>MinIO removed admin features from the community console in May 2025, stopped publishing pre-built binaries and Docker images in October 2025 ("distributed as source code only"), put the repository in maintenance mode in December 2025, and the GitHub repository now shows as archived (April 2026) with a README that says it is no longer maintained and points to the commercial AIStor product. The code is AGPLv3. The last community image is RELEASE.2025-09-07T16-13-09Z. Third-party rebuilds exist (Chainguard's cgr.dev/chainguard/minio and the pgsty/minio fork).</p></aside>
+<p>So the real options are:</p>
+<div class="tw"><table><thead><tr><th>Option</th><th>State (as of Oct 2026)</th><th>Strengths</th><th>Weak spots</th></tr></thead><tbody>
+<tr><td>Ceph RGW</td><td>Tentacle v20.2.2 (Jun 2026)</td><td>Most mature; erasure coding, multisite, STS (AssumeRole, AssumeRoleWithWebIdentity), object lock; many operators and support vendors</td><td>Heavy: monitors, managers, OSDs, gateways; real expertise needed</td></tr>
+<tr><td>SeaweedFS</td><td>v4.48 (28 Sep 2026)</td><td>Simpler components (master, volume servers, filer, S3 gateway); S3 "table buckets" with a built-in Iceberg REST catalog and server-side compaction; volume-data encryption flag</td><td>Smaller operator community; erasure coding (Reed-Solomon 10+4, 1.4x) applies only to sealed, warm volumes, so fresh writes land on normal volumes protected by whatever replication you configure</td></tr>
+<tr><td>RustFS</td><td>1.0.0 (16 Sep 2026), 1.0.1 (3 Oct 2026), Apache-2.0</td><td>Permissive licence; MinIO-like simplicity</td><td>Very young for a system of record</td></tr>
+<tr><td>Garage</td><td>v2.x</td><td>Light, built for small geo-distributed self-hosting</td><td>Designed for resilience across sites on modest hardware; less suited to high-throughput analytics</td></tr>
+<tr><td>MinIO AIStor</td><td>Commercial</td><td>Familiar API and tooling</td><td>Licence cost and dependence on one vendor, against a "no lock-in" goal</td></tr>
+<tr><td>Archived MinIO community</td><td>Unmaintained</td><td>Already known</td><td>No security fixes from upstream for the store holding regulated data</td></tr>
+</tbody></table></div>
+<p><b>My pick and why.</b> Ceph RGW, with an erasure-coding profile of 4 data and 2 parity chunks spread across hosts. <dfn>Erasure coding</dfn> (EC) splits each object into k data chunks and m parity chunks so that any m chunks can be lost; 4+2 survives two lost chunks at 1.5 times the raw size, against 3 times for three full copies. Ceph's pieces, briefly: an <dfn>OSD</dfn> (object storage daemon) manages one drive; <dfn>MONs</dfn> (monitors) keep the cluster map by majority vote, so you run three or five; <dfn>RGW</dfn> (RADOS Gateway) is the stateless S3 front end you put behind a load balancer. The reason is maturity for a system of record, multisite replication for the DR site, and the fact that the team can buy support if it is small.</p>
+<p><b>Runner-up.</b> SeaweedFS, if the team cannot staff Ceph. It is easier to reason about and its table buckets could even replace a separate catalog for a small team, but fewer engineers in the market have operated it, and that matters when you hire your second on-call engineer.</p>
+<aside class="box trap"><b class="lbl">Common mistake</b><p>Choosing the object store from a throughput benchmark. At 40 TB almost any of these stores can saturate a few 25 GbE links. What separates them is how they behave when a drive dies at 10:00 on an expiry Thursday, how long a rebuild takes, how upgrades work, and whether you can hire someone who has done it before. Ask those questions in the proof of concept (POC), by pulling a drive under load.</p></aside>
+<p class="src">Sources: <a href="https://github.com/minio/minio">MinIO repo</a> · <a href="https://ceph.io">Ceph</a> · <a href="https://docs.ceph.com/en/latest/radosgw/STS/">Ceph RGW STS</a> · <a href="https://github.com/seaweedfs/seaweedfs">SeaweedFS</a> · <a href="https://github.com/seaweedfs/seaweedfs/wiki/Erasure-Coding-for-warm-storage">SeaweedFS erasure coding</a> · <a href="https://github.com/rustfs/rustfs">RustFS</a> · <a href="https://garagehq.deuxfleurs.fr/">Garage</a></p>
+
+<h3>Table format and catalog</h3>
+<p><b>Iceberg, on format v2 for now.</b> The Iceberg spec has versions 1 to 3 complete. Version 3 adds deletion vectors (a compact bitmap of deleted rows), row lineage, the variant type, default column values and nanosecond timestamps. Those are useful for tick data with nanosecond exchange timestamps. But a table's format version is a promise to every reader, and upgrades are one-way. As of Oct 2026, Trino treats v3 as experimental (no row-level operations or OPTIMIZE on v3), ClickHouse supports v3 only partially, and the Java library still defaults to v2. My view: stay on v2 until every engine that must read a table reads v3, then upgrade table by table.</p>
+<p><b>Iceberg Java defaults worth saying aloud.</b> Target data file 512 MB, Parquet row group 128 MB, zstd compression, and copy-on-write for deletes, updates and merges. <dfn>Copy-on-write</dfn> rewrites every data file that contains a changed row; <dfn>merge-on-read</dfn> writes small delete files instead and makes readers apply them. Positions tables that change all day suit merge-on-read with regular compaction; append-only tick tables need neither.</p>
+<p><b>The catalog.</b> The catalog is the one component every read and every write passes through: an engine asks it where the current metadata file is, and a commit is a compare-and-swap of that pointer. If the catalog is down, nothing commits and most queries cannot plan. That makes it tier-0, with the same availability bar as the object store.</p>
+<div class="tw"><table><thead><tr><th>Catalog</th><th>State (as of Oct 2026)</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Apache Polaris</td><td>Top-level Apache project since Feb 2026; 1.8.0 (28 Sep 2026)</td><td>REST catalog; principals, principal roles and catalog roles; vends short-lived storage credentials to engines; persistence in Postgres (JDBC) or MongoDB</td></tr>
+<tr><td>Lakekeeper</td><td>v0.14.0 (7 Oct 2026), written in Rust</td><td>Single binary; Postgres 15 or later; OpenFGA authorisation; vended credentials where the store offers STS, and remote signing</td></tr>
+<tr><td>Apache Gravitino</td><td>1.3.1 (30 Sep 2026)</td><td>A metadata layer over many sources that ships an Iceberg REST server</td></tr>
+<tr><td>Project Nessie</td><td>0.109.0 (8 Oct 2026)</td><td>Git-like branches and tags across tables</td></tr>
+<tr><td>Unity Catalog OSS</td><td>0.7.0 (13 Oct 2026)</td><td>Full Iceberg REST read and write</td></tr>
+<tr><td>Hive Metastore</td><td>4.2.1 (Aug 2026)</td><td>Old, widely supported; no REST semantics; Iceberg encryption works with it</td></tr>
+<tr><td>JDBC or SQL catalog</td><td>PyIceberg sql, Trino jdbc, Doris jdbc (experimental since 4.1.0)</td><td>Simple, but each engine talks to the database directly and there is no central permission model</td></tr>
+</tbody></table></div>
+<p>Three ways an engine gets storage access through a catalog, worth defining because agents depend on them. With <dfn>static keys</dfn>, every engine holds a long-lived S3 key. With <dfn>credential vending</dfn>, the catalog checks the caller's permission on a table and returns short-lived credentials scoped to that table's path; on S3-compatible stores this needs the store to implement STS, which Ceph RGW does. With <dfn>remote signing</dfn>, the engine asks the catalog to sign each S3 request, so it never holds a key at all; Lakekeeper supports this. My pick is Polaris for its Apache governance and role model, with Lakekeeper as the close runner-up; I would run both in the POC for two weeks against StarRocks, Spark, PyIceberg and DuckDB (DuckDB writes Iceberg only through a REST catalog).</p>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Iceberg cleans up nothing on its own by default. Snapshot expiry (Java default: snapshots older than 5 days, keep at least 1), orphan-file removal (default: files older than 3 days) and compaction are jobs you schedule and monitor.</li>
+<li>Old <code>metadata.json</code> files are kept unless <code>write.metadata.delete-after-commit.enabled</code> is true; <code>write.metadata.previous-versions-max</code> defaults to 100. A table committed every minute accumulates them fast.</li>
+<li>Iceberg's built-in encryption works only with Hive and REST catalogs and only for Parquet and Avro, and <code>metadata.json</code> stays unencrypted. Plan for that if the MF investor tables must be encrypted at the table level.</li>
+<li>Registering the same <code>metadata.json</code> in two catalogs can corrupt a table, per the Iceberg docs. During a catalog migration, unregister from the old one first.</li>
+</ul></aside>
+<p class="src">Sources: <a href="https://iceberg.apache.org/spec/">Iceberg spec</a> · <a href="https://iceberg.apache.org/docs/latest/configuration/">Iceberg configuration</a> · <a href="https://iceberg.apache.org/docs/latest/maintenance/">Iceberg maintenance</a> · <a href="https://iceberg.apache.org/docs/latest/spark-procedures/">Spark procedures</a> · <a href="https://iceberg.apache.org/docs/latest/encryption/">Iceberg encryption</a> · <a href="https://trino.io/docs/current/connector/iceberg.html">Trino Iceberg connector</a> · <a href="https://clickhouse.com/docs/use-cases/data-lake/support-matrix">ClickHouse data lake support matrix</a> · <a href="https://polaris.apache.org/releases/1.8.0/managing-security/access-control/">Polaris access control</a> · <a href="https://polaris.apache.org/blog/2025/10/21/starrocks-and-apache-polaris-integration-building-a-unified-high-performance-data-lakehouse/">StarRocks with Polaris (Polaris blog)</a> · <a href="https://github.com/lakekeeper/lakekeeper">Lakekeeper</a> · <a href="https://duckdb.org/docs/current/core_extensions/iceberg/writing_to_iceberg.html">DuckDB Iceberg writes</a></p>
+
+<h3>The serving engine: StarRocks, Doris, ClickHouse or Trino</h3>
+<p>Terms first. In StarRocks and Doris, the <dfn>FE</dfn> (frontend) holds metadata, accepts SQL connections and plans queries; you run three for a majority vote. The <dfn>BE</dfn> (backend) stores data on local disk and executes queries. A <dfn>CN</dfn> (compute node) in StarRocks is a BE without permanent data: it executes queries and caches hot data locally. <dfn>Shared-nothing</dfn> means each node owns a slice of the data on its own disks. <dfn>Shared-data</dfn> means the durable copy lives in shared object storage and compute nodes are stateless apart from their cache.</p>
+<div class="tw"><table><thead><tr><th>Question</th><th>StarRocks 4.1</th><th>Doris 4.1</th><th>ClickHouse 26.x (open source)</th><th>Trino 483</th></tr></thead><tbody>
+<tr><td>Storage modes</td><td>Shared-nothing, or shared-data (FE + CN + object store with local cache)</td><td>Coupled, or decoupled (stateless BEs, shared storage, Meta Service on FoundationDB)</td><td>Local disks; s3 disks with a cache disk; zero-copy replication off by default since 22.8 and not recommended</td><td>No storage of its own</td></tr>
+<tr><td>Extra system to run</td><td>None beyond FE and CN</td><td>FoundationDB for the Meta Service</td><td>ClickHouse Keeper for replication</td><td>A catalog (always)</td></tr>
+<tr><td>Workload isolation</td><td>Resource groups; multiple warehouses in shared-data (CelerData announced open-sourcing with 4.0; confirm in your build)</td><td>Compute groups in decoupled mode, documented in open source; workload groups</td><td>Settings profiles, quotas, workload scheduling</td><td>Resource groups</td></tr>
+<tr><td>Iceberg writes</td><td>INSERT and INSERT OVERWRITE (Parquet); DELETE via position deletes since 4.1</td><td>INSERT, INSERT OVERWRITE, UPDATE, DELETE, MERGE INTO</td><td>INSERT beta from 26.2 behind a flag; UPDATE and MERGE unsupported</td><td>INSERT, UPDATE, DELETE, MERGE; optimize and expire_snapshots</td></tr>
+<tr><td>Row and column policies</td><td>Apache Ranger (row filter, masking) since 3.1.9</td><td>CREATE ROW POLICY; masking through Ranger</td><td>Row policies and grants in SQL</td><td>Via access-control plugins</td></tr>
+<tr><td>BACKUP and RESTORE in the decoupled mode</td><td>Not supported in shared-data; Cluster Snapshot for DR instead (beta, 3.4.2 and later, keeps only the latest snapshot)</td><td>Not supported in decoupled mode</td><td>BACKUP to S3 supported</td><td>Not applicable</td></tr>
+<tr><td>Governance</td><td>Linux Foundation project since Feb 2023</td><td>Apache Software Foundation</td><td>Company-led, Apache-2.0</td><td>Trino Software Foundation</td></tr>
+</tbody></table></div>
+<p><b>Why StarRocks first.</b> In shared-data mode it has only two node types, so there is no FoundationDB cluster to learn and back up. It reads Iceberg through an external catalog with the same cache, so the lake stays the source of truth. It has native tables for the few things that need sub-second answers, such as an intraday positions view. History helps you sound informed: StarRocks began in 2020 as a fork of Apache Doris and has rewritten much of the code since, so the two share concepts (FE, BE, tablets, bucketing) and differ in optimizer, execution and storage details.</p>
+<p><b>Why Doris is a close second.</b> Its Iceberg write support is broader today (UPDATE, DELETE, MERGE), which matters if engineers want to correct positions in SQL. Its compute groups give documented BE-level isolation over one copy of data: each BE belongs to one group, and a group's queries run only on its own BEs. The cost is FoundationDB, one more distributed system with its own failure modes.</p>
+<p><b>Why ClickHouse is the runner-up for ticks only.</b> MergeTree on local NVMe is excellent for time-series scans, such as "all NIFTY option trades for this expiry between 14:00 and 15:30, by strike". But the open-source build has no SharedMergeTree (that powers ClickHouse Cloud only), so true compute-storage separation is not available self-hosted; its Iceberg writes are beta and catalog integration is mostly read-only. If the main workload were tick research by a quant team, I would revisit this.</p>
+<p><b>Where Trino fits.</b> Trino is a query engine with no storage, strong at federating many sources. It is a reasonable later addition for ad-hoc joins across the lake and operational databases. Its default <code>retry-policy</code> is NONE, so a lost worker fails the query.</p>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> A few weeks after go-live, the team upgrades the positions table to Iceberg format v3 to get deletion vectors. Next morning a research notebook on Trino and a ClickHouse report both fail on that table, while StarRocks dashboards still work. <b>Diagnosis.</b> The format upgrade is one-way, and two of the readers support v3 only experimentally or partially. Nobody had an inventory of which engine reads which table. <b>Fix.</b> Write a v2 copy of the table under a new name (for example a CREATE TABLE AS SELECT in Spark with format-version 2) and move the affected readers to it; keep the v3 table for the engines that support it. Do not register the old v2 <code>metadata.json</code> as a second table: the Iceberg docs warn that two catalog entries over the same files can lose data or corrupt the table. <b>Lesson.</b> Keep a reader inventory per table and gate format upgrades on it, the same way you gate a schema change.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> At 10:40 on a weekday, every Prefect flow that writes Iceberg fails and half the dashboards show "table not found". <b>Diagnosis.</b> The catalog's Postgres ran as a single VM on a host that rebooted for a firmware update. With the catalog down, engines could not load table metadata unless it was already cached. <b>Fix.</b> Move catalog Postgres to a three-node high-availability setup with a synchronous standby, run at least two catalog replicas, and add the catalog to the change calendar as tier-0. <b>Lesson.</b> The catalog is small in bytes and huge in blast radius. Size its availability by blast radius.</p></aside>
+<p class="src">Sources: <a href="https://docs.starrocks.io/docs/introduction/Architecture/">StarRocks architecture</a> · <a href="https://docs.starrocks.io/docs/administration/management/Backup_and_restore/">StarRocks backup and restore</a> · <a href="https://docs.starrocks.io/docs/administration/user_privs/authorization/ranger_plugin/">StarRocks Ranger</a> · <a href="https://aijourn.com/?p=398523">Report on CelerData open-sourcing multi-warehouse (Sep 2025)</a> · <a href="https://doris.apache.org/docs/dev/compute-storage-decoupled/overview">Doris decoupled mode</a> · <a href="https://doris.apache.org/docs/4.x/key-features/compute-group/">Doris compute groups</a> · <a href="https://doris.apache.org/docs/4.x/admin-manual/data-admin/backup-restore/overview/">Doris backup and restore</a> · <a href="https://clickhouse.com/docs/operations/storing-data">ClickHouse storing data</a> · <a href="https://trino.io/docs/current/connector/iceberg.html">Trino Iceberg</a> · <a href="https://iceberg.apache.org/docs/latest/spark-procedures/">Iceberg Spark procedures (register_table warning)</a> · <a href="https://forum.starrocks.io/t/faq-apache-doris-vs-starrocks/128">StarRocks forum: Doris vs StarRocks</a> · <a href="https://bigdatawire.com/2023/02/14/celerdata-contributes-starrocks-to-the-linux-foundation">StarRocks to the Linux Foundation</a></p>
+
+<h3>Shared-data or shared-nothing at under 40 TB</h3>
+<p>Size does not force the decision: a few modern servers can hold 40 TB of flash. So argue from the other forces.</p>
+<div class="tw"><table><thead><tr><th>Force</th><th>Favours shared-nothing</th><th>Favours shared-data</th></tr></thead><tbody>
+<tr><td>Latency on cold data</td><td>Local NVMe on every read</td><td>First read of cold data goes to the object store; the cache hides it afterwards</td></tr>
+<tr><td>Copies of data</td><td>Engine keeps its own replicas (often 3) in its own format, plus the lake</td><td>One durable copy, in the lake, protected by erasure coding</td></tr>
+<tr><td>Scaling compute</td><td>Adding nodes moves data</td><td>Adding CNs moves no data; caches warm up</td></tr>
+<tr><td>Workload isolation</td><td>Hard: same nodes serve everyone</td><td>Separate compute groups over the same data</td></tr>
+<tr><td>Backup</td><td>Engine BACKUP and RESTORE available</td><td>BACKUP and RESTORE not supported in StarRocks shared-data or Doris decoupled mode; StarRocks offers a beta Cluster Snapshot; protect the lake itself</td></tr>
+<tr><td>Dependencies</td><td>Fewer: the engine is self-contained</td><td>The object store becomes a hard dependency for queries</td></tr>
+</tbody></table></div>
+<p>My view: shared-data, because the lake in Iceberg is the system of record that every engine and later every agent reads, and because isolating the overnight risk batch, the morning dashboards and the agents from each other is worth more than the last few milliseconds. The design rule that follows: anything inside the engine's native tables must be derived and rebuildable from Iceberg, since you cannot BACKUP and RESTORE it in this mode. If a latency target were truly strict (say a sub-100 ms intraday screen), I would put that one workload on a small shared-nothing table set and keep everything else shared-data.</p>
+<aside class="box senior"><b class="lbl">Senior lens</b><p>The decision that matters most here is organisational: how many distinct distributed systems a three-to-five person team can run well. Ceph, an MPP engine, a catalog, Postgres, Prefect and Kubernetes are already six. Each one added (Kafka, FoundationDB, Trino, ClickHouse Keeper) is another upgrade calendar, another failure mode and another skill to hire for. A senior keeps the count low in year one, buys support for the system of record, and writes down the conditions under which a new system earns its place. The second lever is open formats: if the data lives in Iceberg on an S3 API, the engine can be swapped later without a migration project, which is the practical meaning of "no vendor lock-in".</p></aside>
+<p class="src">Sources: <a href="https://dsf.berkeley.edu/papers/hpts85-nothing.pdf">Stonebraker 1986</a> · <a href="https://www.cs.cmu.edu/~15721-f24/papers/Snowflake.pdf">Snowflake SIGMOD 2016</a> · <a href="https://www.usenix.org/conference/nsdi20/presentation/vuppalapati">Snowflake NSDI 2020</a> · <a href="https://www.cs.cmu.edu/~15721-f24/papers/Redshift_Revinvented.pdf">Redshift Re-invented 2022</a> · <a href="https://docs.starrocks.io/docs/quick_start/shared-data/">StarRocks shared-data quickstart</a> · <a href="https://docs.starrocks.io/docs/administration/management/cluster_snapshot/">StarRocks cluster snapshot</a></p>
+
+<h3>Orchestration and ingestion</h3>
+<p><b>Prefect in Airflow terms.</b> A Prefect <dfn>flow</dfn> is a decorated Python function, the equivalent of a DAG. A <dfn>task</dfn> is a unit inside it. A <dfn>deployment</dfn> attaches a schedule and parameters to a flow. A <dfn>work pool</dfn> describes where runs execute (a process, Docker, Kubernetes), and a <dfn>worker</dfn> polls the pool and starts runs, much like the scheduler handing a KubernetesPodOperator task to a Kubernetes cluster. The self-hosted server stores state in a database; to run several API servers you need Postgres 14.9 or later, Redis for event messaging and a load balancer. Two run states to know: <dfn>Late</dfn> means the scheduled start passed without the run reaching Pending (15 seconds by default), and <dfn>Crashed</dfn> means the run failed because of infrastructure. The latest stable release is 3.8.8 (6 Oct 2026).</p>
+<p><b>Ingestion patterns by source.</b> Every pattern below is idempotent: rerunning the same date produces the same table, using overwrite-by-partition or merge on a natural key, which is what lets on-call engineers rerun safely at 06:00.</p>
+<div class="tw"><table><thead><tr><th>Source</th><th>Cadence</th><th>Pattern</th><th>Iceberg write</th></tr></thead><tbody>
+<tr><td>Exchange end-of-day prices, bhavcopy-style files, corporate actions</td><td>Daily after close</td><td>Land file unchanged; validate row counts against the instrument master; write silver</td><td>Overwrite the trade-date partition</td></tr>
+<tr><td>Intraday ticks and quotes (NSE cash and F&amp;O, MCX)</td><td>Continuous in session</td><td>A capture process writes one file per minute to landing; a flow appends hourly; compaction runs after close</td><td>Append; compaction rewrites closed partitions</td></tr>
+<tr><td>Trades and positions from OMS or PMS</td><td>Every 5 to 15 minutes; end-of-day snapshot</td><td>Extract changed rows; merge on trade or position key; keep end-of-day snapshots for as-of P&amp;L</td><td>Merge (merge-on-read) plus daily snapshot tag</td></tr>
+<tr><td>Risk outputs (VaR, Greeks, scenario P&amp;L)</td><td>Overnight batch</td><td>Batch job writes its own run partition, tagged with run id</td><td>Overwrite by run</td></tr>
+<tr><td>Structured-credit loan tapes and cash flows</td><td>Monthly per deal</td><td>File contract per servicer: name pattern, layout, schema check before load</td><td>Overwrite by deal and period</td></tr>
+<tr><td>PDFs: loan agreements, trustee reports, concession documents</td><td>As received</td><td>Store the original under object lock; extract text and fields to silver; chunk and embed for agents</td><td>Append, with document id and hash for lineage</td></tr>
+<tr><td>Mutual fund NAV inputs and investor records</td><td>Daily, deadline-driven</td><td>Separate namespace and bucket, separate keys and roles; data-quality gate before NAV publish</td><td>Merge on investor or folio key</td></tr>
+</tbody></table></div>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>A writer that commits once a minute through the NSE session makes 375 commits a day per table (09:15 to 15:30). That is fine for Iceberg if you compact and expire snapshots; it is a problem if you forget.</li>
+<li>A "Late" run in Prefect is often the first sign that workers are gone (a node drained, a pod evicted). Alert on Late counts as well as Failed counts.</li>
+<li>Keep the raw landing file even after the table is built. When a vendor restates a price file, you replay from landing, and auditors ask for the file as received.</li>
+<li>Write the run id into every table you produce (a column or a snapshot property). It is the on-prem equivalent of tagging every Snowflake query with its run.</li>
+</ul></aside>
+<p class="src">Sources: <a href="https://github.com/PrefectHQ/prefect/releases">Prefect releases</a> · <a href="https://docs.prefect.io/v3/advanced/self-hosted">Prefect self-hosted scaling</a> · <a href="https://docs.prefect.io/v3/concepts/states">Prefect states</a> · <a href="https://py.iceberg.apache.org/api/">PyIceberg API</a></p>
+
+<h3>Governance for AI agents, designed in from day one</h3>
+<p>"internal AI agents" will put software agents in front of positions, P&amp;L, loan documents and investor data. Treat each agent as a principal with an identity, the narrowest permissions that do its job, and a full audit trail. The layers, from the agent inward:</p>
+<ol>
+<li><b>Identity.</b> Each agent has its own service identity in the identity provider, and every call also carries the human user it acts for. Without the second identity, audit logs say "the agent did it", which a compliance officer will not accept.</li>
+<li><b>A gateway with tools.</b> The <dfn>Model Context Protocol</dfn> (MCP) is an open protocol through which an AI application calls tools exposed by a server. The gateway exposes a short list such as <code>get_positions(fund, as_of)</code>, <code>get_pnl(desk, date)</code> or <code>search_loan_documents(deal, query)</code>, each backed by a curated gold view, with row limits and timeouts. A free-form SQL tool, if offered at all, runs under a tightly scoped role.</li>
+<li><b>Engine permissions.</b> <dfn>RBAC</dfn> (role-based access control) grants rights to roles; a <dfn>row-level policy</dfn> filters rows by who is asking (a desk sees only its book); <dfn>column masking</dfn> hides or hashes sensitive columns (an investor's PAN, India's tax identifier, or bank account). StarRocks gets row filters and masking through Apache Ranger; Doris has CREATE ROW POLICY and masks through Ranger.</li>
+<li><b>Catalog permissions.</b> Catalog roles decide which namespaces and tables a principal can even load; the agent's principal never sees the investor namespace.</li>
+<li><b>Storage.</b> Agents never hold object-store keys. Only engines do, and ideally through vended or signed requests.</li>
+<li><b>Audit and budgets.</b> Every query carries a tag with agent, user, tool and request id, lands in the engine's audit log (Doris writes one to <code>__internal_schema.audit_log</code> when enabled; ClickHouse has <code>log_comment</code> in <code>system.query_log</code>), and runs in a resource group with memory and time limits.</li>
+</ol>
+<p>Risks to name before the interviewer does: <dfn>prompt injection</dfn> (instructions hidden inside a document, such as a trustee report PDF, that try to steer the agent), data leaving through the agent's answer, runaway queries, and stale data presented as current. Answers carry an as-of timestamp and the source table, so a PM can see that "exposure to RELIANCE" came from the 18:00 snapshot.</p>
+<p class="src">Sources: <a href="https://docs.starrocks.io/docs/administration/user_privs/authorization/ranger_plugin/">StarRocks Ranger</a> · <a href="https://doris.apache.org/docs/4.x/sql-manual/sql-statements/data-governance/CREATE-ROW-POLICY/">Doris row policy</a> · <a href="https://doris.apache.org/docs/4.x/admin-manual/audit-plugin">Doris audit log</a> · <a href="https://clickhouse.com/docs/operations/settings/settings#log_comment">ClickHouse log_comment</a> · <a href="https://polaris.apache.org/releases/1.8.0/managing-security/access-control/">Polaris access control</a></p>
+
+<h3>What I would build first</h3>
+<p>Build one thin vertical slice end to end before widening: one source, one silver table, one gold mart, one dashboard, monitored and recoverable. A plan that fits 90 days (my judgement; hardware lead time decides the real dates):</p>
+<div class="tw"><table><thead><tr><th>Weeks</th><th>Deliverable</th><th>Exit criterion</th></tr></thead><tbody>
+<tr><td>0 to 2</td><td>Requirements signed off; hardware ordered; POC plan with the top 20 real dashboard queries and the risk batch as the benchmark</td><td>Written success criteria for each POC</td></tr>
+<tr><td>2 to 6</td><td>POC on three test servers: StarRocks vs Doris on three months of real ticks and positions; Ceph vs SeaweedFS with a drive pulled under load; Polaris vs Lakekeeper with every engine</td><td>Decision memo with numbers from representative data</td></tr>
+<tr><td>6 to 10</td><td>Production foundation: object store, catalog with highly available (HA) Postgres, Prefect, monitoring; EOD (end-of-day) prices and positions into silver; one gold mart (daily P&amp;L by fund and desk) with data-quality checks</td><td>PMs use the P&amp;L dashboard for two weeks; freshness target met</td></tr>
+<tr><td>10 to 13</td><td>DR replication to the second site; a restore drill; runbooks; on-call rota</td><td>A table restored at the DR site within the agreed RTO</td></tr>
+<tr><td>After 13</td><td>Intraday ticks with compaction; loan tapes and PDFs; mutual fund data with PII (personally identifiable information) controls; a read-only agent gateway over gold</td><td>Each added with its own SLO (service level objective, defined in the operate section) and owner</td></tr>
+</tbody></table></div>
+<aside class="box trap"><b class="lbl">Common mistake</b><p>Starting the answer with the engine ("I'd use StarRocks because it's fast"). The interviewer hears that you will pick tools before understanding the workload. Start with questions, draw roles, then name products. A second common mistake is letting agents query raw or silver tables directly "for now". Permissions granted early are hard to take back once a PM depends on the answer.</p></aside>
+<dl class="nums">
+<dt>3</dt><dd>FE nodes (or Ceph MONs) for a majority vote that survives one failure.</dd>
+<dt>4+2 / 1.5x</dt><dd>Erasure-coding layout and its raw overhead; three full copies cost 3x.</dd>
+<dt>7 hosts</dt><dd>Minimum for 4+2 with one chunk per host plus one host to self-heal (k + m + 1).</dd>
+<dt>v2</dt><dd>Iceberg format to use until every reader supports v3 (Java default as of Oct 2026).</dd>
+<dt>512 MB / 128 MB</dt><dd>Iceberg Java default target data file and Parquet row group.</dd>
+<dt>5 days / 1</dt><dd>Default snapshot expiry age and minimum snapshots kept.</dd>
+<dt>3 days</dt><dd>Default age before orphan-file removal; keep it longer than your longest write.</dd>
+<dt>375</dt><dd>Minutes in the NSE session; commits per day for a once-a-minute writer.</dd>
+<dt>15 s</dt><dd>Delay after which Prefect marks a scheduled run Late.</dd>
+<dt>14.9 / 15</dt><dd>Minimum Postgres versions: Prefect multi-server setup / Lakekeeper.</dd>
+</dl>
+<aside class="box say"><b class="lbl">Say this</b><p>"I'd start by asking what the 40 TB measures, the freshness and latency targets, RPO and RTO, and how many people will run this, because those set every number. My working design: an S3-compatible object store as the system of record, which after MinIO's archival I'd evaluate as Ceph RGW first and SeaweedFS second, with erasure coding 4+2. Iceberg v2 tables registered in a REST catalog such as Polaris, backed by HA Postgres. StarRocks in shared-data mode as the serving engine, with Doris as the close alternative, and Spark or PyIceberg for batch and table maintenance. Prefect orchestrates ingestion with idempotent, rerunnable flows. Agents never touch storage: they call an MCP gateway over curated views, under their own identity, with row and column policies and every query tagged and audited. I haven't run these self-hosted systems in production. So I'd prove the choices in a short POC on representative ticks and positions, then build one end-to-end slice, daily P&amp;L, before widening."</p></aside>
+</section>
+<section class="topic" id="sizing">
+<h2>Back-of-envelope sizing, with every assumption stated</h2>
+<p class="lede">After the design, a good interviewer asks "so how many servers?" This section works the arithmetic from "under 40 TB" to drives, nodes and network links, with each assumption labelled so you can swap in the real numbers. The point to show is method: the interviewer cares that you know which factors multiply and which failure cases set the floor, more than about the final count.</p>
+
+<h3>The method in one picture</h3>
+<p><dfn>Back-of-envelope sizing</dfn> is a rough calculation done in a few minutes to get the order of magnitude right. You state assumptions, multiply through, and then check the result against failure cases. The chain:</p>
+<pre class="mermaid">flowchart TD
+  A["Logical data today: 40 TB"] --> B["Split by data type"]
+  B --> C["Compress each type"]
+  C --> D["Add layers: landing, silver, gold, AI"]
+  D --> E["Add Iceberg snapshot and rewrite overhead"]
+  E --> F["Grow for 3 years"]
+  F --> G["Multiply by erasure coding 1.5x"]
+  G --> H["Divide by 70 percent fill ceiling"]
+  H --> I["Raw TB to install"]
+  I --> J["Drives and nodes, checked against one node failure"]
+</pre>
+<p>Two terms used below. <dfn>Logical size</dfn> is the size of the data as the user sees it, before durability copies. <dfn>Raw size</dfn> is what the drives must hold after erasure coding or replication. A <dfn>rule of thumb</dfn> is a practitioner's approximation; each one below says where it comes from, and each should be replaced by a measurement on the data during the POC.</p>
+
+<h3>Step 1: what the 40 TB is made of</h3>
+<p>Assumption A1: 40 TB is today's logical, uncompressed data, including history and documents. Assumption A2 is the mix (illustrative; ask for the real split):</p>
+<div class="tw"><table><thead><tr><th>Data type</th><th>Share</th><th>Logical TB</th><th>Compression assumed</th><th>Compressed TB (one copy)</th></tr></thead><tbody>
+<tr><td>Market data: ticks, quotes, EOD prices, MCX</td><td>70%</td><td>28</td><td>5:1</td><td>5.6</td></tr>
+<tr><td>Trades, positions, P&amp;L, risk outputs</td><td>15%</td><td>6</td><td>4:1</td><td>1.5</td></tr>
+<tr><td>Structured-credit loan tapes and cash flows</td><td>5%</td><td>2</td><td>4:1</td><td>0.5</td></tr>
+<tr><td>Documents (PDFs)</td><td>10%</td><td>4</td><td>1:1 (already compressed)</td><td>4.0</td></tr>
+<tr><td><b>Total</b></td><td>100%</td><td><b>40</b></td><td></td><td><b>11.6</b></td></tr>
+</tbody></table></div>
+<p>Where the ratios come from: StarRocks' deployment planning guide uses 3:1 to 5:1 for sizing; columnar tick data sorted by symbol and time often does better because timestamps, prices and quantities change slowly row to row, which suits delta and dictionary encodings. That is a rule of thumb. The honest move is to say "I'd measure it": write one week of real ticks to Parquet with zstd and divide.</p>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Compression ratios vary more by sort order than by codec. The same tick file sorted by arrival time and by (symbol, time) can differ by a large factor; measure both.</li>
+<li>PDFs and images do not compress further. If documents are a big share, they dominate raw capacity even though they are a small share of queries.</li>
+<li>Vendor ratios are measured on vendor data. Quote them as a starting range, never as a plan.</li>
+</ul></aside>
+<p class="src">Sources: <a href="https://docs.starrocks.io/docs/3.4/deployment/plan_cluster/">StarRocks cluster planning</a> · <a href="https://parquet.apache.org/docs/file-format/data-pages/encodings/">Parquet encodings</a></p>
+
+<h3>Step 2: layers, copies and snapshots</h3>
+<p>The lake stores more than one form of each dataset. Assumption A3: the landing zone keeps raw files as received (for audit and replay) with generic compression at about 3:1 for text files; silver holds typed Iceberg tables; gold holds marts and aggregates at about 15% of silver; AI artefacts (extracted text and embeddings) are small; Iceberg keeps extra files until snapshots expire.</p>
+<div class="tw"><table><thead><tr><th>Layer</th><th>Working</th><th>TB</th></tr></thead><tbody>
+<tr><td>Landing (raw as received)</td><td>36 TB structured / 3 = 12.0, plus 4.0 TB PDFs stored once</td><td>16.0</td></tr>
+<tr><td>Silver (typed Iceberg)</td><td>5.6 + 1.5 + 0.5</td><td>7.6</td></tr>
+<tr><td>Gold (marts, aggregates)</td><td>15% of 7.6</td><td>1.1</td></tr>
+<tr><td>AI artefacts</td><td>Extracted text about 0.4 TB; embeddings 10 million chunks x 1,024 floats x 4 bytes = about 41 GB</td><td>0.5</td></tr>
+<tr><td>Iceberg overhead</td><td>20% of silver + gold + AI (9.2 TB): snapshots kept for time travel, files awaiting expiry, compaction rewrites</td><td>1.8</td></tr>
+<tr><td>Engine native hot tables</td><td>Assumed; in shared-data mode these also live on the object store</td><td>1.0</td></tr>
+<tr><td><b>Total logical, day 1</b></td><td></td><td><b>28.0</b></td></tr>
+</tbody></table></div>
+<p>The 20% Iceberg overhead is my judgement, and it depends on churn. An append-only tick table adds almost nothing. A positions table rewritten every 15 minutes under copy-on-write can briefly hold several times its live size until snapshots expire. If a table's live size and its total file size in the <code>files</code> and <code>all_files</code> metadata tables drift apart, expiry is not keeping up.</p>
+
+<h3>Step 3: growth, durability and headroom</h3>
+<p>Assumption A4: 25% growth a year. A bottom-up check on ticks shows why this is deliberately generous. Assume 200 million tick and quote events a trading day across NSE cash, F&amp;O and MCX, at 80 bytes each raw (both are assumptions; ask the market-data team for the real counts). That is 16 GB a day raw, 4.0 TB a year over 250 trading days, which becomes about 0.8 TB in silver and 1.3 TB in landing: around 2.1 TB a year, or about 8% of 28 TB. The rest of the 25% covers new datasets: the mutual fund, more history, alternative data and AI features.</p>
+<div class="tw"><table><thead><tr><th>Quantity</th><th>Working</th><th>Result</th></tr></thead><tbody>
+<tr><td>Logical, year 1 / 2 / 3</td><td>28.0 x 1.25, x 1.25^2, x 1.25^3</td><td>35.0 / 43.8 / 54.7 TB</td></tr>
+<tr><td>Raw used, day 1</td><td>28.0 x 1.5 (EC 4+2)</td><td>42.0 TB</td></tr>
+<tr><td>Raw used, year 3</td><td>54.7 x 1.5</td><td>82.0 TB</td></tr>
+<tr><td>Raw to install for year 3</td><td>82.0 / 0.70 fill ceiling</td><td>117 TB</td></tr>
+</tbody></table></div>
+<p>Why a 70% ceiling: Ceph marks an OSD nearfull at 85% by default, stops backfill (moving data to rebuild redundancy) into an OSD at 90%, and stops writes at 95%. When a node dies, its data is rebuilt onto the survivors, so they must have room. A 70% steady-state ceiling is a common planning rule of thumb that leaves that room; the next subsection checks it.</p>
+<p class="src">Sources: <a href="https://docs.ceph.com/en/latest/rados/configuration/mon-config-ref/">Ceph monitor config (full ratios)</a></p>
+
+<h3>Step 4: object-store nodes and drives</h3>
+<p>Erasure coding 4+2 with one chunk per host needs at least 6 hosts; a 7th lets the cluster re-create lost chunks on a healthy host after a failure. So 7 storage nodes is the floor, set by the failure domain. Capacity then decides drives per node. Two options with 7.68 TB NVMe drives:</p>
+<div class="tw"><table><thead><tr><th>Option</th><th>Raw installed</th><th>Fill day 1</th><th>Fill year 2</th><th>Fill year 3</th><th>After one node fails in year 3</th></tr></thead><tbody>
+<tr><td>A: 7 nodes x 2 drives</td><td>107.5 TB</td><td>39%</td><td>61%</td><td>76% (over the ceiling)</td><td>Each survivor holds 82.0 / 6 = 13.7 TB of 15.4 TB, about 89%: next to backfillfull</td></tr>
+<tr><td>B: 7 nodes x 3 drives</td><td>161.3 TB</td><td>26%</td><td>41%</td><td>51%</td><td>13.7 TB of 23.0 TB, about 59%: rebuild completes</td></tr>
+</tbody></table></div>
+<p>My view: buy chassis with free bays, start with option A, and add a third drive per node during year 2 once real growth is measured. Flash gets cheaper, and the capacity review (see the operate section) catches the trigger. Option A held into year 3 is exactly the trap the 70% rule exists for: one node failure pushes survivors toward 90%, Ceph stops backfilling, and the cluster sits degraded while the next failure could lose data.</p>
+<p><b>Memory and CPU for storage nodes.</b> Ceph's <code>osd_memory_target</code> defaults to 4 GiB per OSD, so three OSDs need about 12 GiB before the gateway, monitors and page cache; 128 GB per node is a comfortable choice (my judgement). Run three MONs on three of the seven nodes, and two or three RGW gateways behind a load balancer.</p>
+<p><b>Rebuild time, the number people forget.</b> In year 3 each node holds about 82.0 / 7 = 11.7 TB of chunks. Rebuilding a lost chunk in 4+2 reads 4 surviving chunks, so recovering one node reads about 4 x 11.7 = 46.8 TB and writes 11.7 TB. If recovery is limited to 2 GB/s across the cluster during market hours (an assumption to protect queries), that is 46,800 / 2 = 23,400 seconds, about 6.5 hours of reduced redundancy. At 5 GB/s overnight it is about 2.6 hours. This is the real argument for NVMe, for 25 GbE, and for deciding the recovery priority in advance.</p>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> A storage cluster that has crept to 81% raw usage loses one node to a failed motherboard. Six hours later Ceph reports OSDs as backfillfull, recovery stops, and health stays in warning with degraded placement groups for two days. <b>Diagnosis.</b> The survivors had to absorb one seventh of the data and crossed the 90% backfill threshold. Usage had grown past the planning ceiling because nobody owned the capacity forecast, and a snapshot-expiry job had been failing quietly, leaving old files in place. <b>Fix.</b> Run snapshot expiry and orphan removal to free space, install spare drives that were on the shelf, and only as a last resort raise the backfill ratio a little with someone watching. <b>Lesson.</b> The fill ceiling is a failure budget. Forecast against it monthly and alert at 70%, well before Ceph's own 85% warning.</p></aside>
+<p class="src">Sources: <a href="https://docs.ceph.com/en/latest/rados/configuration/bluestore-config-ref/">Ceph BlueStore config (osd_memory_target)</a> · <a href="https://docs.ceph.com/en/latest/rados/configuration/mon-config-ref/">Ceph full ratios</a></p>
+
+<h3>Step 5: the engine</h3>
+<p>Size compute from the hot working set and the concurrency, never from total data. The <dfn>hot set</dfn> is the data most queries touch in a normal week. Assumption A5: the hot set is the last 90 trading days of ticks, all positions, P&amp;L and risk, EOD prices, gold, and native hot tables.</p>
+<div class="tw"><table><thead><tr><th>Hot-set item</th><th>Working</th><th>TB</th></tr></thead><tbody>
+<tr><td>Ticks, last 90 trading days</td><td>16 GB raw a day / 5 x 90</td><td>0.29</td></tr>
+<tr><td>Positions, trades, P&amp;L, risk</td><td>Silver figure</td><td>1.5</td></tr>
+<tr><td>EOD prices and reference data</td><td>Assumed</td><td>0.3</td></tr>
+<tr><td>Gold marts</td><td>From step 2</td><td>1.1</td></tr>
+<tr><td>Native hot tables</td><td>From step 2</td><td>1.0</td></tr>
+<tr><td><b>Hot set</b></td><td></td><td><b>about 4.2</b></td></tr>
+</tbody></table></div>
+<p>A reasonable default (my judgement): aggregate cache of 1.5 to 2 times the hot set, so 6 to 8 TB across the interactive CNs. Then:</p>
+<div class="tw"><table><thead><tr><th>Role</th><th>Count</th><th>Per node (my starting point)</th><th>Reasoning</th></tr></thead><tbody>
+<tr><td>FE</td><td>3</td><td>16 cores, 64 GB, mirrored SSD for metadata</td><td>Majority vote; above the 8 cores and 16 GB that StarRocks' planning guide recommends per FE, because agents send many small queries that all need planning</td></tr>
+<tr><td>CN, interactive group</td><td>3</td><td>32 cores, 256 GB, one 3.84 TB NVMe for cache</td><td>11.5 TB cache covers the hot set about 2.7 times; three nodes so one can fail at the open</td></tr>
+<tr><td>CN, batch and agents group</td><td>2</td><td>32 cores, 256 GB, one 3.84 TB NVMe</td><td>Keeps the overnight risk batch, compaction and agent traffic off the dashboard caches</td></tr>
+<tr><td>Batch workers (Spark, Prefect workers)</td><td>3</td><td>32 cores, 256 GB</td><td>Kubernetes pool for transforms and Iceberg maintenance</td></tr>
+<tr><td>Services (catalog x2, Prefect API x2, Redis, gateway, monitoring)</td><td>3</td><td>16 cores, 64 GB</td><td>Small Kubernetes cluster for stateless services</td></tr>
+<tr><td>Postgres HA (catalog, Prefect)</td><td>3</td><td>8 to 16 cores, 64 GB, NVMe</td><td>Primary, synchronous standby, async standby or witness</td></tr>
+</tbody></table></div>
+<p>That is about 24 servers at the primary site including the 7 storage nodes (7 + 3 + 3 + 2 + 3 + 3 + 3). A leaner year-one variant (FEs and Postgres as VMs on the service nodes, a single CN group of three) gets to about 16, at the cost of weaker isolation. The DR site needs at least 6 storage nodes for 4+2, plus a small engine and a Postgres replica.</p>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> Every Monday the 09:15 dashboards are slow for about 40 minutes, then recover. <b>Diagnosis.</b> Weekend research jobs backtest three years of NIFTY and BANKNIFTY options in the same CN group. The cache, sized for the hot set, gets filled with old ticks; Monday's first queries for positions and P&amp;L go to the object store. The cache hit-ratio panel shows the dip every weekend. <b>Fix.</b> Move research to the batch CN group, and warm the key tables before the open with <code>CACHE SELECT</code> (StarRocks 3.3 and later). <b>Lesson.</b> Cache is sized per workload. A cache shared with an unbounded workload is sized for that workload, whatever the spreadsheet says.</p></aside>
+<p class="src">Sources: <a href="https://docs.starrocks.io/docs/3.4/deployment/plan_cluster/">StarRocks cluster planning</a> · <a href="https://docs.starrocks.io/docs/data_source/data_cache/block_cache_warmup/">StarRocks cache warmup</a> · <a href="https://docs.starrocks.io/docs/faq/shared_data_faq/">StarRocks shared-data FAQ</a></p>
+
+<h3>Step 6: network</h3>
+<p>Line rate is the ceiling; real throughput is lower once protocol, erasure-coding and CPU costs are paid, so treat these as upper bounds.</p>
+<div class="tw"><table><thead><tr><th>Link or flow</th><th>Working</th><th>Result</th></tr></thead><tbody>
+<tr><td>One 25 GbE port</td><td>25 / 8</td><td>3.125 GB/s</td></tr>
+<tr><td>Cold full scan of silver by the interactive group</td><td>3 CNs x 3.125 = 9.4 GB/s; 7,600 GB / 9.4</td><td>about 810 s, 13.5 minutes</td></tr>
+<tr><td>Store front-end ceiling</td><td>7 nodes x 3.125</td><td>about 21.9 GB/s</td></tr>
+<tr><td>Erasure-coding write traffic</td><td>1 GB written becomes 6 chunks of 0.25 GB; the primary sends 5 to peers</td><td>1.5 GB on disk, 1.25 GB on the cluster network</td></tr>
+<tr><td>Initial DR seed of 28 TB</td><td>At 1 Gbit/s (125 MB/s): 224,000 s. At 10 Gbit/s: 22,400 s</td><td>2.6 days, or 6.2 hours</td></tr>
+<tr><td>Daily DR change</td><td>Assume 0.3 TB new plus 0.3 TB compaction rewrites over 10 night hours</td><td>about 17 MB/s, 133 Mbit/s</td></tr>
+</tbody></table></div>
+<p>Layout I would propose: a leaf-spine network with 100 GbE between switches; 2 x 25 GbE on storage nodes with Ceph's public and cluster traffic separated; 25 GbE on CNs and workers; 100 GbE for GPU nodes in the AI POC if they read training data from the lake. Two top-of-rack switches per rack so a switch failure is not a rack failure.</p>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Compaction and snapshot rewrites count as change for replication. A DR link sized only for new data falls behind on the night after a big compaction.</li>
+<li>Oversubscription between racks hides until a rebuild. Recovery traffic crosses racks by design, since chunks are spread across failure domains.</li>
+<li>NVMe drives used as cache churn constantly. Check the endurance rating (drive writes per day) for cache drives and watch wear in SMART data.</li>
+<li>Ask the colo vendor about power per rack and lead times before finalising the bill of materials. Dense NVMe servers can hit a rack's power budget before its space budget.</li>
+</ul></aside>
+<aside class="box senior"><b class="lbl">Senior lens</b><p>A senior sizes for the failure case and the year-3 case, then buys for year 1 with a clear expansion trigger. They also price the people: about 24 servers at the primary site and a smaller DR footprint, plus spares, plus support contracts, plus on-call. Against that, the comparison is a managed cloud warehouse, which compliance has ruled out, so the useful framing for the CTO is cost per year for the platform with stated assumptions, and the dates when the capacity review will next ask for money. Finally, they keep the spreadsheet: every assumption in a cell, so when the market-data team says the real figure is 600 million events a day, the plan updates in a minute.</p></aside>
+<aside class="box trap"><b class="lbl">Common mistake</b><p>Multiplying redundancy twice. Teams sometimes apply 3x engine replication, then erasure coding, then a full DR copy, then landing and silver copies of the same data, without noticing that the shared-data design already gives one durable copy in the lake. The opposite mistake is just as common: forgetting the landing zone and Iceberg's retained snapshots, and sizing only from the silver tables.</p></aside>
+<dl class="nums">
+<dt>28 TB</dt><dd>Day-1 logical lake size from 40 TB raw, under the stated assumptions.</dd>
+<dt>54.7 TB</dt><dd>Year-3 logical size at an assumed 25% annual growth.</dd>
+<dt>117 TB</dt><dd>Raw capacity to install for year 3: 54.7 x 1.5 / 0.70.</dd>
+<dt>85% / 90% / 95%</dt><dd>Ceph default nearfull, backfillfull and full ratios.</dd>
+<dt>4 GiB</dt><dd>Ceph default <code>osd_memory_target</code> per OSD.</dd>
+<dt>4 x</dt><dd>Read amplification when rebuilding a 4+2 chunk: read 4 to recreate 1.</dd>
+<dt>3.125 GB/s</dt><dd>Line rate of 25 GbE; the cold-read ceiling per node.</dd>
+<dt>3:1 to 5:1</dt><dd>Compression range in StarRocks' planning guidance (rule of thumb).</dd>
+<dt>8c / 16 GB</dt><dd>StarRocks' recommended size per FE (16c / 64 GB recommended per BE; the guide gives no CN figure).</dd>
+</dl>
+<aside class="box say"><b class="lbl">Say this</b><p>"I'd size it as a chain and say every assumption. First I'd confirm 40 TB is raw logical data. Split by type, compress each: ticks maybe 5 to 1, structured 4 to 1, PDFs not at all, which gives about 12 TB compressed. Add the landing copy, gold, and Iceberg's retained snapshots, and I get roughly 28 TB logical on day one. Grow at 25% a year, about 55 TB by year three. Erasure coding 4+2 adds 1.5x, and I keep usage under 70% so a node can fail and rebuild, so about 117 TB raw. Seven storage nodes is the floor for 4+2 with a spare host. Then I'd check one node failure: survivors must stay well under Ceph's 90% backfill threshold. Engine sizing comes from the hot set and concurrency: about 4 TB hot, so three interactive CNs with NVMe cache plus a separate group for batch and agents. These are rules of thumb; I haven't sized a self-hosted cluster before, so in the POC I'd measure compression and the hot set on representative data and redo the sheet."</p></aside>
+</section>
+<section class="topic" id="operate">
+<h2>Day 2: operating the platform, and eight incident drills</h2>
+<p class="lede">Day 2 is everything after launch: monitoring, alerts, capacity, upgrades, backups, cost and on-call. Senior interviewers move here quickly, because this is where self-hosting costs money and where experience shows. The business cares because a slow morning P&amp;L or a late NAV input is a business incident, and nobody else will run this platform for them.</p>
+
+<h3>SLIs, SLOs and error budgets in plain words</h3>
+<p>An <dfn>SLI</dfn> (service level indicator) is a measured number, such as "share of dashboard queries answered in under 2 seconds". An <dfn>SLO</dfn> (service level objective) is the target for that number over a window, such as "95% of them, each trading day". An <dfn>SLA</dfn> (service level agreement) is a promise with consequences, usually to a customer; an internal platform mostly needs SLOs. The <dfn>error budget</dfn> is the room the SLO leaves: a 99.9% availability SLO over a 30-day month allows 43.2 minutes of failure; counted only over market hours (about 22 days x 375 minutes = 8,250 minutes), it allows about 8 minutes. When the budget is spent, risky changes stop until it recovers.</p>
+<p>SLOs a senior would propose. The targets are examples to agree with the business and calibrate in the POC, and they are my judgement:</p>
+<div class="tw"><table><thead><tr><th>Area</th><th>SLI</th><th>Example SLO</th></tr></thead><tbody>
+<tr><td>Morning readiness</td><td>Positions, P&amp;L and risk gold marts complete and checked</td><td>By 07:30 IST on 99.5% of business days</td></tr>
+<tr><td>Freshness</td><td>Lag between a vendor EOD file arriving and the silver table being queryable</td><td>Under 60 minutes on 99% of trading days</td></tr>
+<tr><td>Dashboard latency</td><td>Latency of the top 20 dashboard queries, 09:00 to 15:30</td><td>p95 under 2 s, p99 under 5 s</td></tr>
+<tr><td>Query success</td><td>Share of dashboard and agent queries that succeed in market hours</td><td>99.9% per month</td></tr>
+<tr><td>Object store</td><td>Share of S3 requests without a server error; GET latency for small objects</td><td>99.9% per month; latency target set from POC baseline</td></tr>
+<tr><td>Catalog</td><td>Commit success rate; table-load latency</td><td>99.95% per month; latency target from baseline</td></tr>
+<tr><td>Data quality</td><td>Critical checks failing on data promoted to gold</td><td>Zero</td></tr>
+<tr><td>NAV inputs (mutual fund)</td><td>Inputs complete and validated before the publication cut-off</td><td>A fixed margin ahead of the regulatory deadline (confirm the current SEBI rule with compliance)</td></tr>
+<tr><td>Recovery</td><td>RPO and RTO per layer</td><td>Catalog RPO minutes; lake RPO about an hour at DR; read service RTO a few hours (examples)</td></tr>
+</tbody></table></div>
+<p>A <dfn>p95</dfn> latency is the time under which 95% of requests finish; p99 is the same for 99%. Percentiles matter because a mean hides the slow tail that PMs actually notice.</p>
+
+<h3>What to monitor, layer by layer</h3>
+<p>Use the same stack you already know: Prometheus scrapes metrics, Grafana draws them and evaluates alerts, OpenSearch holds logs and audit trails. Every layer exposes Prometheus metrics: Ceph through its manager's prometheus module (default port 9283), StarRocks FEs and BEs or CNs on their HTTP ports at <code>/metrics</code>, Postgres and hosts through exporters. Prefect run states come from its REST API, polled by a small exporter or a flow of your own.</p>
+<div class="tw"><table><thead><tr><th>Layer</th><th>What to watch</th><th>Why</th></tr></thead><tbody>
+<tr><td>Hosts and network</td><td>CPU, memory, NVMe wear and SMART errors, NTP offset, NIC errors and drops, link utilisation, certificate expiry</td><td>Most "database" incidents start as a host or network problem</td></tr>
+<tr><td>Object store (Ceph)</td><td>Health state; OSDs up and in; placement-group states (degraded, inactive, inconsistent); raw use of the fullest OSD; recovery throughput; slow ops; RGW request rate, latency and 5xx by operation; scrub errors</td><td>Durability and the latency every engine inherits</td></tr>
+<tr><td>Catalog</td><td>Request rate and latency for table loads and commits; commit conflicts (HTTP 409); 5xx; Postgres connections, replication lag, database size</td><td>Tier-0: every read plans through it</td></tr>
+<tr><td>Iceberg table health</td><td>From metadata tables: data files per partition, average file size, snapshot count, oldest snapshot age, delete-file count, metadata file count, last compaction time</td><td>Tables decay quietly; these numbers show it before queries slow</td></tr>
+<tr><td>Engine (StarRocks)</td><td>FE: JVM heap, GC pauses, leader changes, query latency (<code>starrocks_fe_query_latency_ms</code>), error rate (<code>starrocks_fe_query_err_rate</code>), queued queries. CN: CPU, memory, spill, cache hit ratio, remote read bytes, compaction score</td><td>User-facing latency and its causes</td></tr>
+<tr><td>Ingestion (Prefect)</td><td>Runs by state (Late, Crashed, Failed); duration against baseline; rows written against expected; freshness per table; data-quality pass rate</td><td>Silent pipeline failures look like "no news"</td></tr>
+<tr><td>Agents</td><td>Calls and rows returned per agent; denied requests; query cost per agent; tool error rate</td><td>A new workload shape with new risks</td></tr>
+</tbody></table></div>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Watch the fullest OSD, never the average. Ceph's full and backfill thresholds trigger per OSD, so one hot drive can block writes while the cluster average looks fine.</li>
+<li>StarRocks' shared-data FAQ says the compaction score should stay below about 10; a rising score usually means compaction is failing or starved.</li>
+<li>A pipeline can be alive and logging while producing nothing. Alert on progress (rows landed, snapshots expired, bytes rewritten, freshness) as well as on process health.</li>
+<li>Many StarRocks error-rate metrics count user mistakes too (syntax errors, timeouts). Split agent traffic by user so a chatty agent does not drown the signal.</li>
+</ul></aside>
+<p class="src">Sources: <a href="https://docs.ceph.com/en/latest/mgr/prometheus/">Ceph prometheus module</a> · <a href="https://docs.starrocks.io/docs/administration/management/monitoring/alert/">StarRocks alert rules and metrics</a> · <a href="https://docs.starrocks.io/docs/faq/shared_data_faq/">StarRocks shared-data FAQ</a> · <a href="https://docs.prefect.io/v3/concepts/states">Prefect states</a></p>
+
+<h3>Alerts: what pages a human and what opens a ticket</h3>
+<p>A page wakes someone up; a ticket waits for working hours. Page only when users are hurt or about to be, and make every alert link to a runbook. <dfn>Burn-rate alerting</dfn> pages when the error budget is being spent fast (for example, at a rate that would exhaust the month's budget in a day), which catches real outages without paging on single slow queries.</p>
+<div class="tw"><table><thead><tr><th>Condition</th><th>Action</th></tr></thead><tbody>
+<tr><td>Ceph health error, or any placement group inactive (data unavailable)</td><td>Page</td></tr>
+<tr><td>RGW 5xx above 1% for 5 minutes</td><td>Page</td></tr>
+<tr><td>Catalog unreachable, or commits failing across tables</td><td>Page</td></tr>
+<tr><td>Fewer than two FEs alive, or no FE leader</td><td>Page</td></tr>
+<tr><td>Dashboard latency SLO burning fast during market hours</td><td>Page</td></tr>
+<tr><td>Morning readiness at risk (gold marts not complete by 07:00)</td><td>Page</td></tr>
+<tr><td>Any OSD above 85%; NTP offset on a monitor above Ceph's 0.05 s allowance; certificate expiring within 7 days</td><td>Page</td></tr>
+<tr><td>Any OSD above 70%; capacity forecast hits 70% within the hardware lead time</td><td>Ticket</td></tr>
+<tr><td>Cache hit ratio below target for a day; compaction score rising; snapshot count or small-file ratio above threshold</td><td>Ticket</td></tr>
+<tr><td>Prefect Late runs; NVMe wear above 80%; certificate expiring within 30 days</td><td>Ticket</td></tr>
+</tbody></table></div>
+<aside class="box trap"><b class="lbl">Common mistake</b><p>Paging on every metric that turns red. Within a month the team mutes the channel and misses the one page that mattered. The opposite mistake is just as costly: alerting only on liveness (process up, log line seen). A compaction job that runs every night and rewrites zero files is green on a liveness check and useless in practice.</p></aside>
+
+<h3>Capacity reviews</h3>
+<p>Run one every month, in 30 minutes, with a fixed agenda:</p>
+<ol>
+<li><b>Storage.</b> Raw use of the fullest OSD and of the cluster; growth by bucket and by Iceberg namespace; top 10 tables by growth; the date the forecast hits 70%.</li>
+<li><b>Order trigger.</b> Order hardware when the 70% date minus the vendor's lead time minus a month of buffer arrives. With colo hardware this can be months ahead.</li>
+<li><b>Compute.</b> CPU and memory p95 per compute group in market hours; spill; cache hit ratio against the hot-set size; queued queries.</li>
+<li><b>Metadata.</b> Catalog database size and latency; FE heap; number of tables, partitions and files.</li>
+<li><b>Network.</b> Peak link utilisation, especially during compaction and rebuilds; DR replication lag.</li>
+</ol>
+<p>Quarterly, add a load test with recorded production queries at 1.5 times the peak concurrency, and a DR drill.</p>
+
+<h3>Upgrades without touching trading hours</h3>
+<p>The calendar constrains everything. NSE trades 09:15 to 15:30 IST and MCX non-agricultural contracts trade until 23:30 or 23:55 IST, so the weekday window is roughly midnight to early morning, and weekends are better for anything risky. Freeze changes around month-end, quarter-end, expiry days and NAV deadlines.</p>
+<ul>
+<li><b>Ceph.</b> Rolling upgrades through the cephadm orchestrator (<code>ceph orch upgrade</code>), which restarts managers first, then monitors, then the other daemons (OSDs, gateways), each only when Ceph says the cluster will stay available. For planned host reboots such as OS or firmware patches, set <code>noout</code> so Ceph does not start moving data for a planned restart.</li>
+<li><b>StarRocks.</b> The docs say: upgrade BEs and CNs first, then the follower FEs, then the leader FE; they strongly recommend going one minor version at a time; run <code>ALTER SYSTEM CREATE IMAGE</code> between consecutive upgrades and wait for the image to reach every follower. Downgrade runs the other way round for node types: FEs first (followers, then the leader), then BEs and CNs, again one minor version at a time. A 4.1 cluster can be downgraded only to 4.0.6 or later. CNs restart with cold caches, so warm key tables before the open.</li>
+<li><b>Iceberg.</b> Library upgrades inside engines are routine; table format-version upgrades are one-way, so gate them on a reader inventory.</li>
+<li><b>Catalog and Prefect.</b> Back up Postgres before any schema migration; roll stateless replicas one at a time; pin client and server versions.</li>
+<li><b>Staging.</b> Keep a small staging copy (three storage nodes, one FE, one CN, one catalog) to rehearse every upgrade with production-like data.</li>
+</ul>
+<p class="src">Sources: <a href="https://docs.starrocks.io/docs/deployment/manage_deployment/upgrade/">StarRocks upgrade</a> · <a href="https://docs.starrocks.io/docs/deployment/manage_deployment/downgrade/">StarRocks downgrade</a> · <a href="https://docs.ceph.com/en/latest/cephadm/upgrade/">Ceph cephadm upgrade</a> · <a href="https://www.icicidirect.com/ilearn/commodity/articles/mcx-revision-in-trading-hours-from-march-09-2026">MCX trading hours (broker summary)</a></p>
+
+<h3>Backup and disaster recovery, layer by layer</h3>
+<p><dfn>Replication</dfn> copies changes to another place as they happen; <dfn>backup</dfn> keeps older states you can go back to. Replication alone copies deletions and corruption faithfully, so a design needs both.</p>
+<div class="tw"><table><thead><tr><th>Layer</th><th>Protect</th><th>Method</th><th>Caveat</th></tr></thead><tbody>
+<tr><td>Object store</td><td>All lake files</td><td>Ceph RGW multisite: asynchronous replication of buckets to a zone at the DR colo; versioning; object lock on landing and on records under retention</td><td>Asynchronous means the DR copy lags; object lock in compliance mode cannot be shortened, even by an admin</td></tr>
+<tr><td>Catalog</td><td>Table pointers, namespaces, grants</td><td>Postgres with a synchronous standby, continuous WAL (write-ahead log) archiving for point-in-time recovery, and a standby at DR</td><td>A restored catalog points at metadata files that must still exist; keep snapshot expiry and orphan-removal windows longer than your catalog restore horizon</td></tr>
+<tr><td>Engine</td><td>Native tables, users, grants, DDL</td><td>DDL and grants in Git; native tables rebuilt from Iceberg by script; optionally StarRocks Cluster Snapshot</td><td>BACKUP and RESTORE are not supported in StarRocks shared-data or Doris decoupled mode; Cluster Snapshot is beta (3.4.2 and later), keeps only the latest snapshot, and does not support a running standby</td></tr>
+<tr><td>Prefect</td><td>Deployments, schedules, run history</td><td>Postgres backup; flows and deployment definitions in Git</td><td>Run history is nice to have; schedules and code are what matter</td></tr>
+<tr><td>Keys and secrets</td><td>Keys in the KMS (key management service), service credentials</td><td>Backups of the KMS storage, held separately, with tested unseal procedure</td><td>Losing a data key is losing the data it encrypts</td></tr>
+</tbody></table></div>
+<p>The subtle part is consistency between layers at the DR site. The catalog is replicated through Postgres, the files through RGW multisite, and the two lag differently. After a failover, a table pointer may name a <code>metadata.json</code> whose data files have not arrived yet. The DR runbook therefore checks each critical table: confirm its current metadata and manifests exist, and if not, roll the pointer back to the newest snapshot whose files are all present. Rehearse it quarterly, and time it, because that number is your real RTO.</p>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Restore drills usually fail first on something small: a missing grant, a hard-coded endpoint, a secret that exists only at the primary site.</li>
+<li>Versioned buckets keep every overwritten object. Without a lifecycle rule that expires noncurrent versions, the landing bucket quietly doubles.</li>
+<li>Change one layer per maintenance window. When storage and engine change on the same night and something breaks, nobody can tell which change caused it.</li>
+<li>After any CN restart, the cache hit ratio is the metric to watch for the next hour.</li>
+</ul></aside>
+<aside class="box senior"><b class="lbl">Senior lens</b><p>A senior turns "we have backups" into three tested numbers: RPO, RTO and the date of the last successful restore drill. They also notice cross-layer coupling: Iceberg maintenance settings (expiry age, orphan window) are part of the DR design, because they decide whether an older catalog state still has its files. And they make the engine disposable on purpose, keeping all truth in Iceberg, so the DR plan for StarRocks is "rebuild from the lake with a script we run every quarter", which is simpler and more reliable than backing up a system whose decoupled mode does not support it.</p></aside>
+<p class="src">Sources: <a href="https://docs.ceph.com/en/latest/radosgw/multisite/">Ceph RGW multisite</a> · <a href="https://docs.starrocks.io/docs/administration/management/Backup_and_restore/">StarRocks backup and restore</a> · <a href="https://docs.starrocks.io/docs/administration/management/cluster_snapshot/">StarRocks cluster snapshot</a> · <a href="https://doris.apache.org/docs/4.x/admin-manual/data-admin/backup-restore/overview/">Doris backup and restore</a> · <a href="https://iceberg.apache.org/docs/latest/maintenance/">Iceberg maintenance</a></p>
+
+<h3>Cost visibility when the hardware is already bought</h3>
+<p>On-prem cost is mostly fixed: servers, colo space and power, support contracts and people. Visibility still matters, for two reasons: to justify the next purchase with evidence, and to find waste (a research job that fills the cache every weekend, an agent that scans two years of ticks to answer a one-day question). This is <dfn>showback</dfn>: reporting usage by team without billing them; <dfn>chargeback</dfn> actually bills.</p>
+<ul>
+<li><b>Who ran it.</b> One engine user or role per team and per agent, and resource groups or compute groups per workload.</li>
+<li><b>Why it ran.</b> A tag on every query: app, environment, run id, team or agent. ClickHouse has <code>log_comment</code>, which lands in <code>system.query_log</code>; for StarRocks and Doris, the user, role and resource group in the audit log carry most of it, and the gateway adds request ids.</li>
+<li><b>What it cost.</b> CPU-seconds and bytes scanned per query from the audit log, multiplied by a blended rate: annual cost of the compute group divided by (cores x hours in a year x target utilisation).</li>
+<li><b>What it stores.</b> Bytes per namespace and table from Iceberg's <code>files</code> metadata tables, and per bucket from RGW usage statistics.</li>
+<li><b>What it orchestrates.</b> Prefect run tags and durations per team.</li>
+</ul>
+<p class="src">Sources: <a href="https://clickhouse.com/docs/operations/settings/settings#log_comment">ClickHouse log_comment</a> · <a href="https://doris.apache.org/docs/4.x/admin-manual/audit-plugin">Doris audit log</a></p>
+
+<h3>On-call for a small platform team</h3>
+<ul>
+<li><b>Rota.</b> A weekly primary and secondary. With three to five people, that is on call every few weeks, so the pager must be quiet enough to sleep through most nights.</li>
+<li><b>Severity.</b> Sev 1: trading, P&amp;L or NAV affected. Sev 2: degraded with workaround. Sev 3: ticket.</li>
+<li><b>Runbooks.</b> One per alert, linked from the alert, written as steps a tired person can follow at 06:00.</li>
+<li><b>Escalation.</b> Hardware vendor for parts (know the replacement lead time and keep spare drives on site), storage support contract, engine community or vendor.</li>
+<li><b>Loop.</b> Detect, mitigate, diagnose, fix, verify progress, resume watching, then a blameless postmortem with owned actions.</li>
+</ul>
+<pre class="mermaid">flowchart LR
+  A["Alert fires with runbook link"] --> B["Triage: which layer, who is hurt"]
+  B --> C["Mitigate: fail over, throttle, roll back"]
+  C --> D["Diagnose the real cause"]
+  D --> E["Fix and verify a progress metric moves"]
+  E --> F["Resume watching"]
+  F --> G["Postmortem and runbook update"]
+</pre>
+
+<h3>Incident drills across every layer</h3>
+<p>These are realistic, typical scenarios of the kind teams running this stack often hit. Practise telling each one in under a minute: symptom, diagnosis, fix, lesson.</p>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> At 10:05 on an expiry day the positions dashboard's p95 rises from about 1 s to 6 s, and Ceph reports degraded placement groups. <b>Diagnosis.</b> An NVMe drive failed at 09:58 and recovery started. During weekend maintenance someone had set <code>osd_mclock_profile</code> to <code>high_recovery_ops</code> to speed a rebalance and never reset it, so recovery is taking most of the drives' capacity, and every CN cache miss now waits on a busy store. <b>Fix.</b> Set the profile to <code>high_client_ops</code> for market hours (or back to the default, which is <code>balanced</code> in current releases), let recovery run faster after the MCX close, then replace the drive. <b>Lesson.</b> Decide the recovery policy per time window in advance, write it in the runbook, and alert when a cluster setting drifts from its baseline.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> From 02:10, every write from one rack's workers fails with HTTP 403 <code>RequestTimeTooSkewed</code>, and Ceph warns of clock skew on a monitor. <b>Diagnosis.</b> A firewall change cut that rack's NTP servers from their upstream, and clocks drifted. S3 signature version 4 rejects requests whose timestamp is off by more than about 15 minutes, and Ceph monitors tolerate only 0.05 s of drift by default. <b>Fix.</b> Restore time sync, configure several internal time sources per rack, and alert on offset well before either limit. <b>Lesson.</b> Time is a dependency of authentication and of consensus. Monitor it like a service.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> Around 11:00, hourly tick appends start failing with <code>CommitFailedException</code>, and intraday data falls 40 minutes behind. <b>Diagnosis.</b> A new compaction job was rewriting today's still-open partition. Every append's commit conflicted with the rewrite, and Iceberg retries a failed commit 4 times by default before giving up. <b>Fix.</b> Compact only closed partitions (yesterday and older) during the session, enable partial progress for large rewrites so they commit in pieces, and schedule full compaction after the close. <b>Lesson.</b> Iceberg's optimistic concurrency is cheap when writers touch different files. Design schedules so they do.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> On Monday some partitions of a two-year MCX tick backfill fail with "file not found", although Sunday's backfill reported success. <b>Diagnosis.</b> On Saturday night an engineer ran orphan-file removal with <code>older_than</code> set to one hour to free space. The backfill had already written files that it had not yet committed; they looked like orphans and were deleted, and the later commit pointed at missing files. The Iceberg docs warn that a retention shorter than the longest write can corrupt a table. <b>Fix.</b> Roll the table back to the snapshot before the backfill and rerun it; wrap orphan removal in a script that refuses anything under the 3-day default. <b>Lesson.</b> Maintenance jobs are production writes. Give them guard rails and owners.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> Object-store usage grows by 4 TB in a month while logical data grows by 0.5 TB. <b>Diagnosis.</b> The snapshot-expiry flow ran every night and reported success, but after a namespace rename it was expiring tables that no longer existed. The positions table, rewritten every 15 minutes under copy-on-write, kept every snapshot and every old file. <b>Fix.</b> Point the job at the catalog's live table list, alert on progress (snapshots expired and bytes freed per run, oldest snapshot age per table), and switch the positions table to merge-on-read with daily compaction. <b>Lesson.</b> A green job and a working job are different things. Measure what the job changed.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> At 11:30 the PM dashboards start queueing, and some time out. <b>Diagnosis.</b> In the agent pilot, an SQL tool generated a join of the full tick table with positions without a date filter. The query scanned two years of data and took most of the memory in the compute group that dashboards also used. <b>Fix.</b> Kill the query; move agent traffic to its own compute group or resource group with memory and time limits; expose curated views that require a date and fund filter; cap rows returned by each tool. <b>Lesson.</b> Agents generate queries nobody reviewed. Give them a sandbox sized for mistakes.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> The morning P&amp;L shows several F&amp;O positions with zero mark-to-market. <b>Diagnosis.</b> The vendor's EOD file arrived truncated, with about half the option contracts. The flow checked the schema, which was valid, but never checked completeness, so missing prices became missing marks. <b>Fix.</b> Add a completeness check against the expected contract count from the instrument master (with a tolerance), compare file size and checksum with the vendor manifest, and block promotion to gold on failure. After the vendor resent the file, the idempotent flow overwrote the partition. <b>Lesson.</b> The dangerous failure is missing rows. Test for them explicitly.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> At 00:00 on a Saturday every engine, flow and catalog call to the object store fails with TLS handshake errors. <b>Diagnosis.</b> The certificate on the RGW load balancer, issued by the internal CA a year earlier, expired. Nothing monitored its expiry date. <b>Fix.</b> Issue a new certificate, then automate issuance and renewal, and alert at 30 and 7 days before expiry. <b>Lesson.</b> Certificates are scheduled outages unless something renews them.</p></aside>
+<p class="src">Sources: <a href="https://docs.ceph.com/en/latest/rados/configuration/mclock-config-ref/">Ceph mClock</a> · <a href="https://docs.ceph.com/en/latest/rados/configuration/mon-config-ref/">Ceph monitor config</a> · <a href="https://iceberg.apache.org/docs/latest/maintenance/">Iceberg maintenance</a> · <a href="https://iceberg.apache.org/docs/latest/spark-procedures/">Iceberg Spark procedures</a> · <a href="https://iceberg.apache.org/docs/latest/configuration/">Iceberg configuration</a></p>
+
+<dl class="nums">
+<dt>43.2 min / 8.25 min</dt><dd>A 99.9% error budget over a 30-day month / over one month of NSE market hours (22 x 375 minutes).</dd>
+<dt>9283</dt><dd>Default port of Ceph's prometheus manager module.</dd>
+<dt>0.05 s</dt><dd>Default clock drift Ceph monitors allow.</dd>
+<dt>~15 min</dt><dd>Clock skew S3 SigV4 tolerates before rejecting requests.</dd>
+<dt>4</dt><dd>Iceberg default commit retries (<code>commit.retry.num-retries</code>).</dd>
+<dt>below ~10</dt><dd>Healthy StarRocks shared-data compaction score.</dd>
+<dt>600 s</dt><dd>Default interval of StarRocks automated cluster snapshots when enabled (only the latest is kept).</dd>
+<dt>70% / 85%</dt><dd>Ticket threshold and page threshold for the fullest OSD (my defaults; Ceph's nearfull is 85%).</dd>
+</dl>
+<aside class="box say"><b class="lbl">Say this</b><p>"For day 2 I'd start from SLOs the business agrees to: morning P&amp;L marts ready by a fixed time, dashboard p95 under a couple of seconds in market hours, freshness per source, and RPO and RTO per layer. Then monitoring per layer in Prometheus and Grafana: Ceph health and the fullest OSD, catalog commit and load latency, Iceberg table health from metadata tables, engine latency, cache hit ratio and compaction score, and Prefect run states. I page only on user impact, and I alert on progress, since a maintenance job can be green while doing nothing. Monthly capacity reviews forecast the 70% date against hardware lead time. Upgrades happen after the MCX close or at weekends, in the documented order. For backup, replication isn't enough: object lock and versioning on the lake, point-in-time recovery for catalog Postgres, and the engine kept rebuildable from Iceberg, since shared-data StarRocks doesn't support BACKUP and RESTORE. For cost, query tags are the pattern: every query carries who and why. These are the failure modes I'd rehearse first."</p></aside>
+</section>
+<section class="topic" id="openers">
+<h2>Seven openers, one per HR topic</h2>
+<p class="lede">The topics for the round were listed up front. Expect each one to open with a broad prompt such as "tell me about shared-data versus shared-nothing", followed by two or three probing follow-ups. Below is a 60-second answer for each, at the level of a strong mid-level engineer: it defines the idea, names the mechanism, states a trade-off and a failure mode, is honest that you have not operated the system, and ends on what it means for the business.</p>
+
+<h3>The shape of a 60-second answer</h3>
+<p>Spoken English runs at roughly 130 to 160 words a minute (a common rule of thumb), so each opener below is about 150 words. Each one follows the same five beats, which makes them easy to remember under pressure:</p>
+<ol>
+<li><b>Define</b> the idea in one sentence a non-specialist would follow.</li>
+<li><b>Mechanism</b>: how it works, with one concrete detail (a default, a number, a component name).</li>
+<li><b>Trade-off</b>: what you gain and what you pay.</li>
+<li><b>Failure mode</b>: what you would watch, phrased as "the thing I'd watch for is...".</li>
+<li><b>Business tie-in</b>: one sentence tying it to their data or their plan.</li>
+</ol>
+<p>Say the honesty line once per answer, early and plainly, then move on. Repeating it sounds like apology; skipping it risks being caught out on a follow-up.</p>
+<pre class="mermaid">flowchart LR
+  T1["Distributed DB hosting"] --> L1["Engine layer"]
+  T2["Iceberg tables and catalog"] --> L2["Table and catalog layer"]
+  T3["Shared data vs shared nothing"] --> L1
+  T4["Compression and encryption"] --> L2
+  T4 --> L3["Object store layer"]
+  T5["Independent scaling"] --> L1
+  T5 --> L3
+  T6["MPP performance factors"] --> L1
+  T7["Object storage for the lake"] --> L3
+  L1 --> D["One platform design"]
+  L2 --> D
+  L3 --> D
+</pre>
+<p>Every topic lands on one of three layers of the same design. If a follow-up drifts, steer back to the design: "in the platform I'd build, that shows up as...".</p>
+
+<h3>1. Distributed database: hosting</h3>
+<aside class="box say"><b class="lbl">Say this</b><p>"I haven't hosted a self-managed MPP cluster; I've worked with managed systems, and I'd be honest about what I have operated. Here's how I'd host one. Split the roles: coordinators that hold metadata, like StarRocks or Doris FEs, run as three for a majority vote; workers scale with the workload. Spread them across failure domains: racks, power feeds, top-of-rack switches. Use NVMe for anything latency-sensitive and at least 25 GbE. I'd keep storage and the engine on bare metal in year one and put stateless services, the catalog, Prefect and an agent gateway, on a small Kubernetes cluster. Upgrades follow the documented order, for StarRocks BEs and compute nodes first, then follower FEs, then the leader. The thing I'd watch for is maintenance colliding with trading. That means changes after the MCX close or at weekends, and no single point of failure in front of the 09:15 open."</p></aside>
+<p><b>Likely follow-ups.</b> "Why not run everything on Kubernetes?" (operators exist for StarRocks and for Ceph through Rook; my view is to add them once the team has run the systems on bare metal and knows their failure modes). "How many FEs, and why odd?" (three; a majority of three survives one loss, and a fourth adds cost without tolerating a second failure).</p>
+<p class="src">Sources: <a href="https://docs.starrocks.io/docs/deployment/manage_deployment/upgrade/">StarRocks upgrade</a> · <a href="https://docs.starrocks.io/docs/introduction/Architecture/">StarRocks architecture</a></p>
+
+<h3>2. Iceberg tables and catalog</h3>
+<aside class="box say"><b class="lbl">Say this</b><p>"Iceberg is a table format: rules for metadata files that turn Parquet files on object storage into a table with snapshots, schema evolution and atomic commits. The catalog holds one pointer per table to the current metadata file, and a commit is a compare-and-swap of that pointer, so two writers can't both win. The AWS Glue Data Catalog is a managed cousin, but I haven't operated an Iceberg REST catalog. Three things I'd watch. The catalog is tier-0, so it needs highly available Postgres behind it. Maintenance is a job you own, since by default Iceberg expires nothing and compacts nothing; the Java defaults are 5-day snapshot expiry and a 3-day orphan window when you run them. And the format version must match every reader: I'd stay on v2 because Trino treats v3 as experimental and ClickHouse supports it partially. A REST catalog like Polaris or Lakekeeper gives every engine one source of truth and is where agent permissions start."</p></aside>
+<p><b>Likely follow-ups.</b> "What happens when two jobs commit at once?" (both write files; the first swap wins; the second re-reads, re-applies its change if it does not conflict, and retries, 4 times by default). "Why REST over Hive Metastore?" (a standard HTTP API with central authorisation and credential vending, independent of any one engine).</p>
+<p class="src">Sources: <a href="https://iceberg.apache.org/spec/">Iceberg spec</a> · <a href="https://iceberg.apache.org/docs/latest/configuration/">Iceberg configuration</a> · <a href="https://iceberg.apache.org/docs/latest/spark-procedures/">Iceberg Spark procedures</a> · <a href="https://trino.io/docs/current/connector/iceberg.html">Trino Iceberg</a> · <a href="https://clickhouse.com/docs/use-cases/data-lake/support-matrix">ClickHouse support matrix</a></p>
+
+<h3>3. Shared data versus shared nothing</h3>
+<aside class="box say"><b class="lbl">Say this</b><p>"Shared-nothing means each node owns a slice of the data on its own disks, like classic Redshift or self-hosted ClickHouse; Stonebraker's 1986 paper set out the idea. Shared-data means the durable copy lives in shared storage and compute nodes are stateless apart from a local cache, like Snowflake or Redshift RA3. Shared-nothing gives the lowest latency and the fewest dependencies. Shared-data gives one copy of the data, compute you can add without moving data, and separate compute groups for separate workloads. At under 40 TB, size doesn't force either. Both styles are common in managed systems, though I haven't operated either self-hosted. I'd still lean shared-data, because the lake in Iceberg is the system of record and isolation between the risk batch, dashboards and agents matters most. The failure mode I'd watch is cold cache after a restart or scale-out. And neither StarRocks nor Doris supports BACKUP and RESTORE in that mode, so all truth has to live in Iceberg."</p></aside>
+<p><b>Likely follow-ups.</b> "Where does shared-disk fit?" (shared-disk means every node sees the same block storage, as in Oracle RAC; it needs cluster-wide locking, and shared-data on object storage avoids that by making files immutable). "When would you pick shared-nothing?" (a strict latency target on a small hot table, or an object store the team does not trust yet).</p>
+<p class="src">Sources: <a href="https://dsf.berkeley.edu/papers/hpts85-nothing.pdf">Stonebraker 1986</a> · <a href="https://www.cs.cmu.edu/~15721-f24/papers/Snowflake.pdf">Snowflake SIGMOD 2016</a> · <a href="https://www.cs.cmu.edu/~15721-f24/papers/Redshift_Revinvented.pdf">Redshift Re-invented 2022</a> · <a href="https://docs.starrocks.io/docs/administration/management/Backup_and_restore/">StarRocks backup and restore</a> · <a href="https://doris.apache.org/docs/4.x/admin-manual/data-admin/backup-restore/overview/">Doris backup and restore</a></p>
+
+<h3>4. Compression and encryption</h3>
+<aside class="box say"><b class="lbl">Say this</b><p>"Columnar compression is two layers. Encodings such as dictionary, run-length and delta exploit the shape of a column; then a general codec like LZ4 or zstd squeezes the pages. Tick data sorted by symbol and time compresses well; StarRocks' planning guide uses 3:1 to 5:1, but I'd measure on a week of representative ticks. Iceberg's Java default is zstd. For encryption: TLS in transit everywhere, including between nodes; at rest, drive or object-store encryption covers stolen disks. Iceberg 1.11 added envelope encryption of data and manifest files through a KMS, with limits: Hive and REST catalogs only, Parquet and Avro only, metadata.json stays clear, and the built-in KMS clients are AWS, GCP and Azure, so on-prem means writing a client for Vault or OpenBao. Compress first, then encrypt, since encrypted bytes don't compress. I haven't run a KMS in production. The hard part is key custody: an HA KMS and separate keys for mutual-fund investor data."</p></aside>
+<p><b>Likely follow-ups.</b> "What does encryption cost in performance?" (AES with CPU instructions is cheap next to decompression and I/O; the bigger costs are KMS availability and key rotation operations). "Does encryption at rest stop an insider with SQL access?" (no; that is the job of RBAC, row policies and masking, so encryption and access control are separate controls).</p>
+<p class="src">Sources: <a href="https://iceberg.apache.org/docs/latest/encryption/">Iceberg encryption</a> · <a href="https://github.com/apache/iceberg/releases">Iceberg releases</a> · <a href="https://parquet.apache.org/docs/file-format/data-pages/encodings/">Parquet encodings</a> · <a href="https://parquet.apache.org/docs/file-format/data-pages/encryption/">Parquet modular encryption</a> · <a href="https://docs.starrocks.io/docs/3.4/deployment/plan_cluster/">StarRocks cluster planning</a></p>
+
+<h3>5. Independent scaling and performance considerations</h3>
+<aside class="box say"><b class="lbl">Say this</b><p>"Independent scaling means adding compute without buying storage, and the reverse. Snowflake's virtual warehouses work this way: they resize without touching storage, and Redshift RA3 works the same way; on-prem it means a shared-data engine on top of an object store. Adding compute is quick because CNs hold no durable data, but new nodes start with empty caches, so the first queries read from the object store. Adding storage in Ceph means new drives or nodes and a rebalance, which costs network and belongs outside trading hours. The performance considerations I'd watch: cache hit ratio against the hot-set size, network to the store, where 25 GbE is about 3.1 GB per second per node, object-store latency for small reads, and planning time on tables with too many small files. I haven't operated this myself; these are the numbers I'd put on the dashboard first. The reason to want independent scaling is isolation: the overnight risk batch, morning dashboards and agents each get compute over one copy of data."</p></aside>
+<p><b>Likely follow-ups.</b> "How much did elasticity matter in practice?" (Snowflake's NSDI 2020 paper, using 14 days of February 2018 data, reported that about a fifth of virtual warehouses were ever resized and 82% never were, so isolation is often the bigger win). "How do you warm a cache?" (StarRocks has <code>CACHE SELECT</code> since 3.3; run it for key tables before the open).</p>
+<p class="src">Sources: <a href="https://www.usenix.org/conference/nsdi20/presentation/vuppalapati">Snowflake NSDI 2020</a> · <a href="https://docs.starrocks.io/docs/data_source/data_cache/block_cache_warmup/">StarRocks cache warmup</a> · <a href="https://docs.starrocks.io/docs/faq/shared_data_faq/">StarRocks shared-data FAQ</a></p>
+
+<h3>6. Factors that define performance in an MPP database</h3>
+<aside class="box say"><b class="lbl">Say this</b><p>"For me it comes down to three questions: how much data a query reads, how evenly the work is spread, and how much data moves between nodes. Reading less comes from columnar storage, partition pruning, sort keys and zone maps, which are per-block min and max values, so a query for one NIFTY expiry touches a few files. Even spread comes from bucketing on a high-cardinality key, because the slowest node sets the query's time. Less movement comes from colocated or broadcast joins instead of shuffling big tables, chosen by a cost-based optimizer that needs fresh statistics. Then the engine itself: vectorised execution, parallelism, memory and spill, and concurrency limits. Query tags and QUERY_HISTORY-style attribution are a useful pattern; I'd read StarRocks query profiles with the same habit of measuring before tuning, though I haven't tuned one in production. Morning P&amp;L dashboards under concurrency are mostly a data-layout and cache problem."</p></aside>
+<p><b>Likely follow-ups.</b> "How would you find a straggler?" (in the query profile, compare the maximum and the average time of each operator across instances; a big gap means skew). "What makes a good bucket key for positions?" (high cardinality and even distribution, such as an instrument or position id; a fund id with one dominant fund is a classic skew).</p>
+<p class="src">Sources: <a href="https://15721.courses.cs.cmu.edu/spring2024/schedule.html">CMU 15-721 Spring 2024</a> · <a href="https://trino.io/docs/current/optimizer/cost-based-optimizations.html">Trino cost-based optimizer</a></p>
+
+<h3>7. Object storage and a suitable lake setup: performance</h3>
+<aside class="box say"><b class="lbl">Say this</b><p>"Object storage is a flat key-value store over HTTP: PUT, GET, LIST, DELETE, no rename and no append, which is why table formats exist. I've used managed object storage, but I haven't run a self-hosted store. Since MinIO's community edition is archived and ships as source only, I'd evaluate Ceph RGW first for maturity and SeaweedFS as the lighter option. Setup: erasure coding 4+2 across at least six hosts plus one to self-heal; buckets per zone, landing, silver and gold, plus a restricted one for mutual-fund investor data; versioning and object lock on landing. For performance: data files of a few hundred megabytes, Iceberg targets 512 MB by default; compaction behind any streaming writer; avoid LIST-heavy access; 25 GbE; stateless gateways behind a load balancer. The failure mode I'd watch is a rebuild on a cluster that's too full, which is why I'd plan to a 70% ceiling. This store is the system of record."</p></aside>
+<p><b>Likely follow-ups.</b> "Is there a request-rate limit like S3's?" (AWS S3 documents at least 3,500 writes and 5,500 reads per second per partitioned prefix; on-prem there is no such per-prefix figure, and gateway CPU and the bucket index set the limits). "Why not HDFS?" (it needs a NameNode that holds all file metadata in memory and is a different API from the S3 one every engine now speaks).</p>
+<p class="src">Sources: <a href="https://github.com/minio/minio">MinIO repo</a> · <a href="https://ceph.io">Ceph</a> · <a href="https://github.com/seaweedfs/seaweedfs">SeaweedFS</a> · <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html">AWS S3 performance</a> · <a href="https://iceberg.apache.org/docs/latest/configuration/">Iceberg configuration</a></p>
+
+<h3>Two stories to have ready</h3>
+<p>Interviewers often ask "what could go wrong?" after an opener. These two typical scenarios fit the encryption and MPP-performance topics, which the operate drills cover less.</p>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> At 09:05, queries on the encrypted mutual-fund tables fail, while every other table works. <b>Diagnosis.</b> The KMS cluster lost quorum after two of its three nodes were patched together. Engines could not unwrap the data keys, so encrypted files could not be read. <b>Fix.</b> Restore quorum, then patch KMS nodes one at a time, monitor the KMS like tier-0, and allow short-lived caching of unwrapped keys where the security policy permits. <b>Lesson.</b> Encryption moves part of your availability into the key service. Its SLO must be at least as strict as the data it protects.</p></aside>
+<aside class="box incident"><b class="lbl">Incident</b><p><b>Symptom.</b> A positions query that should take a second takes eight, and adding CNs does not help. <b>Diagnosis.</b> The table is bucketed by fund id, and one flagship fund holds most positions. The query profile shows one instance doing most of the scan while the others idle. <b>Fix.</b> Rebucket on a high-cardinality key such as position or instrument id, and keep fund as a filter column. <b>Lesson.</b> In MPP systems the slowest instance sets the time; more nodes cannot fix uneven work.</p></aside>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Lead with the definition even if the interviewer is senior. It shows you can explain the idea to the business, which a head of a new central team needs.</li>
+<li>Have one number per topic ready: 3 FEs, 1.5x for 4+2, 512 MB files, 3.1 GB/s per 25 GbE port, 3:1 to 5:1 compression, 70% fill ceiling, v2 format.</li>
+<li>When you do not know, say what you would check and where: "I'd confirm that in the StarRocks release notes for our version during the POC."</li>
+</ul></aside>
+<aside class="box field"><b class="lbl">Field notes</b><ul>
+<li>Version-sensitive facts age fast. Say "as of the current release" and name it (StarRocks 4.1, Doris 4.1, ClickHouse 26.x, Iceberg 1.12) to show you checked recently.</li>
+<li>If asked to compare products, structure the answer as architecture, operations, ecosystem support, governance and licence. It sounds considered even when the details are thin.</li>
+</ul></aside>
+<aside class="box senior"><b class="lbl">Senior lens</b><p>A senior answer to each opener adds one sentence about operations and one about the organisation: who runs it, what it costs to run, and what happens to the team when it breaks. "Shared-data lets us isolate the agents from the PM dashboards, so a bad agent query becomes a ticket instead of a page" is the kind of sentence that separates a senior from a strong mid-level answer.</p></aside>
+<aside class="box trap"><b class="lbl">Common mistake</b><p>Answering a concept question with a product tour ("StarRocks has X, Doris has Y"). Interviewers ask about shared-data versus shared-nothing to test whether you understand the mechanism and the trade-off. Products are examples, mentioned after the idea is clear.</p></aside>
+<dl class="nums">
+<dt>130 to 160</dt><dd>Words per minute in normal speech (rule of thumb); about 150 words per opener.</dd>
+<dt>5 beats</dt><dd>Define, mechanism, trade-off, failure mode, business tie-in.</dd>
+<dt>1</dt><dd>Honesty line per answer: said once, early, plainly.</dd>
+<dt>3,500 / 5,500</dt><dd>AWS S3 writes / reads per second per partitioned prefix, at least.</dd>
+<dt>about 20%</dt><dd>Share of Snowflake virtual warehouses resized at least once in the NSDI 2020 study (14 days of February 2018 data).</dd>
+</dl>
+</section>
+<section class="topic" id="honesty">
+<h2>Talking about depth without claiming experience</h2>
+<p class="lede">You will be asked about systems you have studied but not run. Interviewers respect a clear line between what you did and how you reason, and they test it with "tell me about a time" follow-ups. One box, to reread before the call.</p>
+</section>

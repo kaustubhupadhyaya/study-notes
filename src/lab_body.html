@@ -1,0 +1,92 @@
+<section class="topic" id="what"><h2>What this is</h2>
+<p class="lede">An optional, short hands-on run that shows the theory pages in action: an object store, an Iceberg table written through a REST catalog, a second engine reading the same table, and the small-files problem. It runs in about 30 seconds on a laptop, with no Docker. Reading the outputs below is enough if you don't run it.</p>
+<div class="tw"><table><thead><tr><th>Piece</th><th>Role in the lab</th><th>Where</th></tr></thead><tbody>
+<tr><td>SeaweedFS 4.48 <code>weed mini</code></td><td>S3-compatible object store (port 8333) and a built-in Iceberg REST catalog (port 8181)</td><td><code>D:\lakehouse-lab-data\bin\weed.exe</code></td></tr>
+<tr><td>PyIceberg 0.12, PyArrow 26, DuckDB 1.5.6</td><td>Writer, file inspector, and a second reading engine</td><td><code>D:\lakehouse-lab-data\.venv</code></td></tr>
+<tr><td><code>lab.py</code> and <code>README.md</code></td><td>The nine steps and how to start the store</td><td><code>$env:USERPROFILE\lakehouse-lab</code></td></tr>
+</tbody></table></div>
+<aside class="box asof"><b class="lbl">As of Oct 2026</b><p>The lab uses SeaweedFS because the MinIO community edition stopped shipping binaries in Oct 2025 and its repository was archived in 2026. SeaweedFS also ships an Iceberg REST catalog inside the same binary, which is why one program covers both the store and the catalog here.</p></aside>
+</section>
+
+<section class="topic" id="run"><h2>Run it (three commands)</h2>
+<pre><code class="lang-text"># 1. start the object store + Iceberg catalog (localhost only, lab-only credentials)
+cd D:\lakehouse-lab-data
+$env:AWS_ACCESS_KEY_ID="labadmin"; $env:AWS_SECRET_ACCESS_KEY="labadmin-local-only"; $env:S3_BUCKET="raw"
+Start-Process -WindowStyle Hidden .\bin\weed.exe -ArgumentList "mini","-dir=D:/lakehouse-lab-data/seaweed","-ip=127.0.0.1","-ip.bind=127.0.0.1","-tableBucket=lakehouse" -RedirectStandardOutput seaweed.log -RedirectStandardError seaweed.err
+
+# 2. run the nine steps
+cd $env:USERPROFILE\lakehouse-lab
+D:\lakehouse-lab-data\.venv\Scripts\python.exe -I lab.py
+
+# 3. stop the store
+Stop-Process -Name weed</code></pre>
+</section>
+
+<section class="topic" id="steps"><h2>The nine steps and what they showed</h2>
+<p class="lede">Real output from a verified run in October 2026. Timings will differ on another machine; the shapes won't.</p>
+
+<h3>1. Object storage is a flat key space</h3>
+<pre><code class="lang-text">keys under prefix broker_a/: ['broker_a/2026-10-13/trades.csv', 'broker_a/2026-10-14/trades.csv']
+range GET of the first 8 bytes: b'trade_id'</code></pre>
+<p>"Folders" are only key prefixes. A range GET reads part of an object, which is how engines read a Parquet footer without downloading the file. There is no rename and no append, which is why a table format needs a catalog to commit changes atomically.</p>
+
+<h3>2. Compression and sort order on 400,000 trades</h3>
+<pre><code class="lang-text">none, time order                  9.06 MB  ratio vs none  1.0x  write    394 ms  read    62 ms
+snappy, time order                6.17 MB  ratio vs none  1.5x  write    322 ms  read    63 ms
+lz4, time order                   6.15 MB  ratio vs none  1.5x  write    323 ms  read    52 ms
+zstd-3, time order                3.63 MB  ratio vs none  2.5x  write    300 ms  read    59 ms
+zstd-9, time order                3.56 MB  ratio vs none  2.5x  write    625 ms  read    77 ms
+zstd-3, shuffled                  5.35 MB  ratio vs none  1.7x  write    443 ms  read    70 ms
+zstd-3, sorted by symbol,ts       3.57 MB  ratio vs none  2.5x  write    342 ms  read    66 ms
+column 'ts' encodings: ('PLAIN', 'RLE', 'RLE_DICTIONARY'); min/max 09:15:00 .. 15:29:59 IST</code></pre>
+<p>ZSTD at level 3 gave a 2.5x smaller file than no compression for about the same read time. Level 9 bought almost nothing and doubled write time. Shuffling the same rows cost a third of the gain, because compression feeds on neighbouring values that look alike. The footer keeps min/max per column, which is what lets engines skip files.</p>
+
+<h3>3. Create an Iceberg table through a REST catalog</h3>
+<pre><code class="lang-text">table location: s3://lakehouse/market/trades
+current metadata file: s3://lakehouse/market/trades/metadata/v2.metadata.json</code></pre>
+<p>The table is partitioned by <code>day(ts)</code>, Iceberg's hidden partitioning: queries filter on <code>ts</code> and never mention a partition column.</p>
+
+<h3>4. Walk the metadata tree on object storage</h3>
+<pre><code class="lang-text">  1 x data file (.parquet)
+  1 x manifest (*.avro)
+  1 x manifest list (snap-*.avro)
+  2 x metadata.json
+data file example: 00000-0-c23aa43f-….parquet  rows=400000  size=4.26 MB</code></pre>
+<p>Catalog points to <code>metadata.json</code>, which points to a manifest list per snapshot, which lists manifests, which list data files with per-column stats. Two <code>metadata.json</code> files because create and append were two commits.</p>
+
+<h3>5. Snapshots and time travel</h3>
+<pre><code class="lang-text">snapshot 3775024942261689501  op=append     rows visible=400,000
+snapshot 3631631337377974667  op=append     rows visible=700,000
+snapshot 2575635864008417879  op=overwrite  rows visible=672,065</code></pre>
+<p>The delete of one symbol shows up as an <code>overwrite</code>: PyIceberg rewrote the affected file (copy-on-write). Every older snapshot stays readable until it is expired.</p>
+
+<h3>6. Schema evolution without rewriting data</h3>
+<pre><code class="lang-text">rows with venue NULL (old files untouched): 672,065; rows with venue NSE: 50,000</code></pre>
+<p>Iceberg tracks columns by field id, so adding <code>venue</code> touched only metadata. Old files read the new column as NULL.</p>
+
+<h3>7. Partition pruning from metadata alone</h3>
+<pre><code class="lang-text">files planned for the whole table: 3; for 14 Oct only: 1</code></pre>
+<p>The planner dropped two of three files using manifest statistics before opening any Parquet file.</p>
+
+<h3>8. A second engine reads the same table</h3>
+<pre><code class="lang-text">('NIFTY-FUT', 119671, 35084400)
+('BANKNIFTY-FUT', 60119, 17597275)
+('RELIANCE', 30224, 8763150)
+('TCS', 24119, 6967425)</code></pre>
+<p>PyIceberg wrote the table and DuckDB read it straight from object storage: no copy, no lock-in. The skew is visible too: NIFTY futures carry about 40% of the trades, which is exactly the kind of key you must not distribute an MPP table on.</p>
+
+<h3>9. The small-files problem, then snapshot expiry</h3>
+<pre><code class="lang-text">data files 3 -> 23; snapshots now 24; full scan 0.14s -> 0.27s
+snapshots after expire_snapshots(): 1</code></pre>
+<p>Twenty tiny "every-minute" appends added 4,000 rows (0.6% more data), twenty files and twenty snapshots, and nearly doubled the full-scan time. Compaction (Spark, Trino, StarRocks, or SeaweedFS's server-side compaction; PyIceberg can't compact yet) would merge them. Expiring snapshots keeps the metadata small.</p>
+</section>
+
+<section class="topic" id="extra"><h2>Optional: add a storage node without adding compute</h2>
+<pre><code class="lang-text">.\bin\weed.exe volume -dir=D:/lakehouse-lab-data/vol2 -mserver=127.0.0.1:9333 -ip=127.0.0.1 -ip.bind=127.0.0.1 -port=9341
+
+# master topology afterwards (http://127.0.0.1:9333/dir/status)
+volume servers: 2
+127.0.0.1:9340  volumes=3  max=531
+127.0.0.1:9341  volumes=0  max=8</code></pre>
+<p>The master registered a second volume server and new writes can land there. Nothing about the query side changed. That is independent scaling of storage, in miniature.</p>
+</section>

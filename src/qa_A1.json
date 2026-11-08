@@ -1,0 +1,326 @@
+[
+ {
+  "id": "A1-01",
+  "topic": "architectures",
+  "q": "Explain shared-nothing versus shared-data, also called storage-compute separation. Which would you pick for us, and why?",
+  "mid": "In shared-nothing, each node owns a partition of the data on local disk, with replicas on other nodes, so scans are local and fast but adding or losing a node means copying data. In shared-data, one durable copy sits in object storage and compute nodes hold only caches, so compute and storage scale separately and separate compute groups can isolate workloads. For a small on-prem team I would start with shared-nothing for the hot serving data, with three replicas.",
+  "senior": "I would separate three decisions: where the source of truth lives (Iceberg on object storage, an open format that answers the lock-in concern), how the serving engine stores hot data, and how many quorums the team can operate. Shared-data cuts durability overhead from three NVMe copies to about 1.5x with 4+2 erasure coding and removes rebalancing storms, but performance then depends on the cache hit ratio and the object store becomes critical; Doris 3.0 reports about 35% lower query performance on TPC-DS with a fully cold cache (a vendor figure). Snowflake's own SIGMOD 2016 paper says on-prem clusters can usually tolerate shared-nothing's problems because resizes and upgrades are rare. So shared-nothing first, and shared-data as a phase 2 once the object store has a track record.",
+  "followups": [
+   {
+    "q": "What exactly is shared in shared-data, and how does it differ from shared-disk such as Oracle RAC?",
+    "a": "Shared-data shares immutable files in an object store through a metadata service, so cached files never go stale and compute nodes need no cache-coherence traffic. Shared-disk shares mutable disk blocks, so instances must keep their caches coherent (Cache Fusion in RAC), which limits scaling."
+   },
+   {
+    "q": "What would make you choose shared-data from day one?",
+    "a": "Hard isolation needs between heavy concurrent workloads that resource groups cannot meet, an object store that is already proven in production, and a team comfortable running it. Without the object store track record I would wait."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A1-02",
+  "topic": "architectures",
+  "q": "What does independent scaling of storage and compute actually buy an on-prem firm like ours?",
+  "mid": "It lets you add compute without buying disks and add storage without buying CPUs, and it lets separate compute groups read the same data. On-prem the hardware is bought up front either way, so the gain is less about paying per second and more about isolation and flexibility.",
+  "senior": "The honest on-prem list is workload isolation (risk batch versus dashboards versus agents), cheaper durability (one erasure-coded copy instead of three NVMe copies), stateless compute that can be upgraded or replaced without moving data, and storage growth on dense servers without buying CPUs. The costs are an object store to run, cache warm-up after every restart, the network as the data path, and more metadata machinery. Elasticity is capped by the racks you own, so I would not sell it as cloud elasticity.",
+  "followups": [
+   {
+    "q": "How big is the storage saving at our size?",
+    "a": "In my illustrative plan, year-3 data is about 16.5 TB compressed. Three replicas need about 49 TB of NVMe plus headroom, around 92 TB raw across six nodes, while 4+2 erasure coding needs about 25 TB on disk, roughly 35 TB raw at 70% fill, plus a few TB of cache. Measured compression decides the real numbers."
+   },
+   {
+    "q": "Can you get isolation without shared-data?",
+    "a": "Partly. StarRocks resource groups and Doris workload groups cap CPU and memory per workload inside a shared-nothing cluster, but the workloads still share disks and network. Separate compute groups give harder isolation."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A1-03",
+  "topic": "hosting",
+  "q": "How would you host StarRocks, Doris or ClickHouse on-prem: bare metal, VMs or Kubernetes?",
+  "mid": "Data nodes need local NVMe and clear failure domains, so bare metal is the simplest home for them. Kubernetes works through operators, StatefulSets and local persistent volumes, and it suits the stateless parts such as Prefect workers, Trino and the catalog service.",
+  "senior": "Stateful systems on Kubernetes need PodDisruptionBudgets so a drain never takes two replicas or two FEs at once, memory requests equal to limits, usually no CPU limits because CFS throttling turns into p99 spikes, anti-affinity across racks, and a named owner for the operator, which becomes critical software. VMs hide failure domains, for example two FEs on one hypervisor host. My view is database nodes on bare metal or dedicated Kubernetes nodes with local NVMe, shared Kubernetes for stateless pieces, and never learning Kubernetes storage and a new MPP engine at the same time in production.",
+  "followups": [
+   {
+    "q": "What happens when a Kubernetes node holding a local volume dies?",
+    "a": "The pod cannot move with its data. The replacement starts on another node with an empty disk, and the database rebuilds it from other replicas, so recovery is done by the engine's repair process."
+   },
+   {
+    "q": "Which operators exist?",
+    "a": "As of Oct 2026: the StarRocks Kubernetes Operator (StarRocksCluster with FE, BE and CN), the Apache Doris Operator (DorisCluster with FE, BE, CN and broker, plus a separate DorisDisaggregatedCluster resource for decoupled mode), Altinity's ClickHouse operator (ClickHouseInstallation and ClickHouseKeeperInstallation), and ClickHouse Inc's own Apache-2.0 operator announced in January 2026 (ClickHouseCluster and KeeperCluster, still a v1alpha1 API)."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A1-04",
+  "topic": "hosting",
+  "q": "Walk me through capacity planning for our data, roughly 40 TB.",
+  "mid": "Stored size is raw size times replicas divided by compression, which is the formula in the StarRocks planning guide. Add growth over the planning horizon, keep disks well below full so merges and compaction have room, and then size CPU and memory for concurrency.",
+  "senior": "First I would ask whether 40 TB is raw or compressed, whether it includes the loan PDFs, how long full-depth ticks are kept, and how many concurrent users and agents to expect. Illustratively, 30 TB of structured data at 4:1 is 7.5 TB, three replicas make 22.5 TB, and 30% yearly growth for three years (a factor of 2.197) gives about 49 TB, so six nodes need about 12 TB of flash each to stay under 70% normally and under 85% after one node is lost. I would also check repair time, since about 8 TB must be re-copied after a node loss, roughly 2.3 hours at an effective 1 GB/s, and size backends well above the StarRocks floor of 16 cores and 64 GB for dashboard and agent concurrency.",
+  "followups": [
+   {
+    "q": "Where does the compression ratio come from?",
+    "a": "The StarRocks planning guide quotes 3:1 to 5:1. I would treat it as a placeholder and measure it by loading a week of real ticks and positions."
+   },
+   {
+    "q": "Why plan for a node being down?",
+    "a": "After a failure the survivors absorb the lost node's replicas. If they are already near full, repair fails or pushes disks past engine thresholds; Doris, for example, defaults to an 85% high watermark on the FE, an FE flood stage at 95% with under 1 GB free, and a BE flood stage at 90% with under 1 GB free."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A1-05",
+  "topic": "distributed-basics",
+  "q": "How is data distributed across nodes in these engines? How would you lay out a tick table?",
+  "mid": "StarRocks and Doris partition a table, usually by time, and split each partition into hash buckets; each bucket is a tablet with replicas on different nodes. ClickHouse partitions inside each server and shards across servers through a Distributed table. For ticks I would partition by trade date and bucket by instrument.",
+  "senior": "A bucket key needs high cardinality and even frequency: bucketing on the underlying symbol would put every NIFTY option tick for a day in one tablet if index options dominate volume, so I would use the instrument token or random bucketing. I would keep tablets around 1 to 10 GB as StarRocks recommends and watch total tablet count, since daily partitions with 64 buckets and three replicas over five years is 350,400 tablet replicas. Tables that join often, such as trades and positions on account, should share a bucket key for colocated joins, and in ClickHouse inserts should be batched because inserts are delayed at 1,000 and rejected at 3,000 active parts per partition by default.",
+  "followups": [
+   {
+    "q": "What does partition pruning give you, compared with bucketing?",
+    "a": "Pruning skips whole partitions that cannot match the filter, such as other months. Bucketing spreads one partition across nodes so the scan runs in parallel, and aligned buckets allow joins without a network shuffle."
+   },
+   {
+    "q": "What happens in ClickHouse when you add a shard?",
+    "a": "Existing data stays where it is. You raise the new shard's weight to steer new inserts to it, or move old data yourself."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A1-06",
+  "topic": "distributed-basics",
+  "q": "What happens when a node dies in a shared-nothing cluster?",
+  "mid": "The metadata service notices missed heartbeats and marks the node dead. Queries read the other replicas, and loads continue while enough replicas remain for the write quorum. After a grace period the missing replicas are cloned onto other nodes.",
+  "senior": "Queries that were running on the dead node fail and need a client retry, and re-replication competes with queries for disk and network, so the grace period and repair throttles are business choices; I would watch information_schema.fe_tablet_schedules in StarRocks or SHOW PROC '/cluster_health/tablet_health' in Doris. In ClickHouse a returning replica fetches the parts it missed and moves broken parts to a detached folder, and if every replica of a shard is down, queries fail unless skip_unavailable_shards is set, which is usually wrong for a P&L number. In Trino a dead worker fails its queries unless a retry policy (QUERY or TASK) is set, and a dead coordinator drops every running query.",
+  "followups": [
+   {
+    "q": "DECOMMISSION or DROP when removing a backend?",
+    "a": "DECOMMISSION copies replicas off first and then removes the node. DROP removes it at once and leaves the cluster to rebuild replicas, which the StarRocks docs call dangerous."
+   },
+   {
+    "q": "And in shared-data mode?",
+    "a": "No data is lost because the durable copy is in object storage. Work moves to other compute nodes, which start with cold caches, so queries are slower until the caches warm."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A1-07",
+  "topic": "distributed-basics",
+  "q": "Why do metadata services run 3 or 5 nodes? What are quorum and split brain?",
+  "mid": "A quorum is a majority of the voting nodes, and a change commits once a majority has stored it. Three voters survive one failure and five survive two. Split brain is two halves of a cluster both accepting writes, and majority voting prevents it because two separate groups cannot both hold more than half.",
+  "senior": "Even numbers add a voter without adding tolerance, since four voters tolerate one failure just like three. Placement matters more than count: three voters across two racks lose quorum when the rack holding two of them fails, so you need three failure domains. StarRocks FEs replicate metadata through BDB JE with a leader, followers and non-voting observers, Doris uses the same design plus FoundationDB in decoupled mode, ClickHouse Keeper uses Raft, and frequent leader elections usually point to network drops or long JVM garbage-collection pauses on FEs.",
+  "followups": [
+   {
+    "q": "What happens when two of three StarRocks FEs die?",
+    "a": "There is no majority and no leader, so loads and DDL fail. Restore one follower to regain quorum; restarting a single FE as leader through the documented metadata recovery is a last resort that can lose recent changes."
+   },
+   {
+    "q": "What happens when ClickHouse Keeper loses quorum?",
+    "a": "Inserts into replicated tables fail, and after a server restart the replicated tables come up read-only. SELECT queries keep working because reads do not use Keeper."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A1-08",
+  "topic": "hosting",
+  "q": "How would you lay out a highly available cluster across racks in our colo?",
+  "mid": "Spread replicas and metadata nodes across racks so one rack failure takes out neither a quorum nor all copies of any data. Use the engine's rack labels for replica placement and put a load balancer in front of the FE query port.",
+  "senior": "I would design for three failure domains: three racks, or two racks plus a small server on separate power and a separate switch for the third voter. One FE or Keeper node per domain, two backends per domain, and rack-aware placement so each tablet has one replica per domain, using StarRocks BE labels (labels.location, since 3.2.8), Doris location tags with replication_allocation, or manual replica placement in ClickHouse. Each server gets dual 25 GbE ports across two top-of-rack switches, and a second site in another city receives backups and lake data asynchronously, sized to an RPO and RTO agreed with the business.",
+  "followups": [
+   {
+    "q": "Why not replicate synchronously to the DR site?",
+    "a": "It adds the inter-city round trip, often ten milliseconds or more, to every write and ties the two sites' availability together. Asynchronous shipping of backups and lake data with a stated RPO is the usual choice."
+   },
+   {
+    "q": "What goes wrong if two FEs are VMs on one host?",
+    "a": "The host is a hidden shared failure domain, and losing it loses the quorum. Placement has to be checked at the physical level."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A1-09",
+  "topic": "architectures",
+  "q": "In a shared-data engine, what role does the cache play, and what happens when it is cold?",
+  "mid": "Compute nodes cache hot data from object storage in memory and on local NVMe. With a warm cache, performance is close to shared-nothing; with a cold cache every read goes to the object store and queries slow down.",
+  "senior": "Doris 3.0 release notes report performance on par with coupled mode when the cache is warm, about 10% lower when partially hit and about 35% lower when it misses completely (vendor figures). Caches go cold after restarts, upgrades, compute-node replacement or a shift to old data, so I would size the cache from the measured hot set, run warm-up jobs before market open, check how newly loaded data is cached, and give the object store enough IOPS for bursts. The cache hit ratio per workload, next to object-store latency, becomes the main performance signal.",
+  "followups": [
+   {
+    "q": "How do you size the cache?",
+    "a": "From query logs: which partitions a typical week reads, plus a margin. A cache slightly smaller than the hot set thrashes, evicting files just before they are needed again."
+   },
+   {
+    "q": "Does the object store's request rate matter?",
+    "a": "Yes. AWS documents at least 3,500 write and 5,500 read requests per second per partitioned prefix; an on-prem store's limits depend on its hardware and gateways, so load-test it with realistic object sizes."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "A1-10",
+  "topic": "distributed-basics",
+  "q": "How does replication work in ClickHouse compared with StarRocks or Doris? Is it synchronous or asynchronous?",
+  "mid": "StarRocks and Doris replicate each tablet, three replicas by default, and a load succeeds once a write quorum confirms; in StarRocks the default write_quorum is MAJORITY. ClickHouse replicates per table with ReplicatedMergeTree, asynchronously and multi-master, coordinated through Keeper.",
+  "senior": "A ClickHouse insert waits for one replica by default, so a part can be lost if that server dies before others fetch it, and reads through a Distributed table can land on a lagging replica. For official data I would use insert_quorum, set max_replica_delay_for_distributed_queries to skip laggards, and watch system.replicas for absolute_delay, queue_size and is_readonly. In StarRocks, write_quorum ONE is faster and riskier than MAJORITY, and load labels in StarRocks and Doris make retries of the same load safe.",
+  "followups": [
+   {
+    "q": "How would you stop a P&L report reading half-replicated data?",
+    "a": "Use quorum writes or confirm the replicas are in sync, then publish atomically with write-audit-publish, for example a partition swap or INSERT OVERWRITE, so readers only query the published table."
+   },
+   {
+    "q": "What does a replica cost?",
+    "a": "Disk times the replication factor, every load written and compacted that many times, network for each copy, and repair traffic after failures. Beyond safety, replicas also spread read concurrency."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A1-11",
+  "topic": "hosting",
+  "q": "What do day-2 operations look like for a self-hosted MPP database, especially upgrades and backups?",
+  "mid": "Rolling upgrades one node at a time, in the order the engine documents, and regular backups to object storage with tested restores. Monitoring and alerting sit on top of both.",
+  "senior": "Order is engine-specific: StarRocks upgrades BEs and CNs before FEs, followers before the leader, one minor version at a time; Doris disables repair and balancing, canaries one BE, upgrades the BEs and then the FEs with the master last, and in decoupled mode starts with the Meta Service and Recycler; ClickHouse rolls one replica per shard after reading the release notes for incompatible changes. For backups, StarRocks BACKUP writes full snapshots to an S3-compatible repository, shared-data clusters use Cluster Snapshot (beta since v3.4.2), which keeps the data snapshot alongside the original files and retains only the latest automated snapshot, and ClickHouse BACKUP TO S3 supports incremental chains through base_backup. Iceberg snapshots live in the same bucket as the data, so the bucket itself must be replicated to a second site, and only restore drills prove any of it works.",
+  "followups": [
+   {
+    "q": "What goes wrong if you upgrade StarRocks FEs first?",
+    "a": "The docs warn that the inverted order can make FEs and BEs incompatible and crash the service. Write a runbook per engine and rehearse it on staging."
+   },
+   {
+    "q": "How often would you test restores?",
+    "a": "Quarterly is a reasonable default, plus after any change to backup credentials or repository configuration, with alerts on every backup failure."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A1-12",
+  "topic": "hosting",
+  "q": "What would you monitor on a self-hosted analytical database?",
+  "mid": "Query latency percentiles, concurrency and queueing, memory use and killed queries, disk usage and node health. Logs go to a search index, and alerts sit on top of both.",
+  "senior": "I would add the engine-specific debts: compaction backlog in StarRocks and Doris, part counts and merges in ClickHouse, unhealthy tablets and clone tasks, replica lag and read-only replicas, FE heap, garbage collection and leader changes, Keeper latency, and in shared-data mode the cache hit ratio and object-store latency and errors. StarRocks and Doris expose Prometheus metrics on FE port 8030 and BE port 8040, ClickHouse keeps system.query_log, system.parts, system.merges and system.replicas, and Trino exposes OpenMetrics at /metrics. I would also measure progress, meaning freshness and row counts of key tables, because a cluster can be alive while the data is stale.",
+  "followups": [
+   {
+    "q": "Which alert would you add first?",
+    "a": "Disk usage per data directory at 70% and 80%, because merges, backfills and node failures can eat headroom within hours, and full disks cascade into failed loads."
+   },
+   {
+    "q": "How would you attribute cost without Snowflake credits?",
+    "a": "Tag queries with a run and client identifier, for example ClickHouse's log_comment setting, and aggregate CPU time and bytes read from the query log against amortised hardware cost."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A1-13",
+  "topic": "architectures",
+  "q": "Should the lake be the source of truth with hot serving tables on top? How do you keep the two consistent?",
+  "mid": "Yes. Land everything in Iceberg on object storage and load only hot data into the MPP engine's native tables for low latency. Serving tables can always be rebuilt from the lake, which also keeps the engine replaceable.",
+  "senior": "I would record the Iceberg snapshot ID each serving table version was built from, so any dashboard number traces to an exact lake version, and publish serving tables atomically after checks. Lake writes should be owned by the tool with the strongest Iceberg write support, because engines differ (as of Oct 2026): Doris supports INSERT, INSERT OVERWRITE, UPDATE, DELETE and MERGE INTO, StarRocks supports INSERT and INSERT OVERWRITE with DELETE since 4.1, and ClickHouse INSERT into Iceberg is beta since 26.2. Colder history can be queried in place through external catalogs or materialized views.",
+  "followups": [
+   {
+    "q": "What if a correction lands in the lake after the serving table was built?",
+    "a": "The publish job sees a new snapshot touching the affected partitions, rebuilds those partitions in staging, validates them and swaps them in. Reports show which snapshot they used."
+   },
+   {
+    "q": "Why not query Iceberg directly for everything?",
+    "a": "Latency and concurrency. Dashboards and agents want sub-second answers on hot data, which native or cached tables give more predictably than reading Parquet from object storage."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "A1-14",
+  "topic": "distributed-basics",
+  "q": "How do CAP and PACELC apply to an analytics platform? What consistency do NAV and P&L need?",
+  "mid": "CAP says that during a network partition a system must choose consistency or availability. PACELC adds that in normal operation the trade-off is latency against consistency. NAV and P&L must read one consistent snapshot of holdings and prices.",
+  "senior": "Metadata services choose consistency and stop accepting writes without a majority, ClickHouse replicated data leans towards latency with asynchronous copies, StarRocks and Doris loads commit atomically, and Iceberg gives snapshot isolation with optimistic commits. For a mutual fund NAV, I would use write-audit-publish so readers only ever see validated, published data. On a single-site cluster the daily decisions are write quorums, tolerance for replica lag and the moment data becomes visible, which is why the pick-two framing of CAP is the wrong one there.",
+  "followups": [
+   {
+    "q": "What is read-your-writes, and when does it bite?",
+    "a": "It is a process reading back what it just wrote. With asynchronous replicas a validation task may hit a lagging replica and see fewer rows, so route it to the same replica, use quorum inserts, or sync before validating."
+   },
+   {
+    "q": "What does Iceberg do when two writers commit at once?",
+    "a": "Each prepares new files and tries to swap the table's metadata pointer. One wins; the other sees that the pointer moved, re-checks its changes against the new state and retries the commit, and fails only if the two changes truly conflict."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "A1-15",
+  "topic": "hosting",
+  "q": "How would you secure a self-hosted database cluster?",
+  "mid": "TLS on connections, LDAP or Active Directory for authentication, role-based access control, audit logs and encryption at rest. Credentials live in a secret store.",
+  "senior": "Someone must run an internal certificate authority and rotate certificates, and inter-node traffic should use TLS where the engine supports it. Roles separate analysts, pipelines and a narrowly scoped role for AI agents, with row-level policies for sensitive data such as investor records where the engine offers them, and audit logs shipped off the cluster so administrators cannot edit them. Encryption at rest comes from self-encrypting drives or Linux disk encryption, object-store server-side encryption and Iceberg table encryption for the lake, and since SEBI's CSCRF covers AIFs and mutual funds, compliance should define what the platform must evidence.",
+  "followups": [
+   {
+    "q": "How do AI agents get governed access?",
+    "a": "Through a service identity with read-only roles on curated views, row and column restrictions, query limits through resource groups, and an audit trail of every query they run."
+   },
+   {
+    "q": "Where do database credentials live?",
+    "a": "In a secret store, fetched at runtime by the pipeline's identity and scoped per environment, never in code or SQL text."
+   }
+  ],
+  "level": "core"
+ },
+ {
+  "id": "A1-16",
+  "topic": "architectures",
+  "q": "What happens when you add nodes to a shared-nothing cluster?",
+  "mid": "The engine rebalances: StarRocks and Doris move tablets onto the new nodes automatically so data and load even out. That copying uses disk and network on nodes that are also serving queries.",
+  "senior": "Balancing is on by default in StarRocks (tablet_sched_disable_balance is false), and moving a third of the data competes with queries and loads, so I would pause it during market hours, throttle it overnight and watch fe_tablet_schedules. ClickHouse behaves the opposite way: adding a shard moves nothing, so old shards stay hot and you steer new data with weights or move partitions yourself. The Snowflake paper names this membership-change cost as a core weakness of shared-nothing; shared-data reassigns work and refills caches instead.",
+  "followups": [
+   {
+    "q": "How would you plan the expansion?",
+    "a": "Add the nodes before a weekend, cap balancing concurrency, disable balancing during trading hours, watch network and clone progress, and confirm the old nodes have disk headroom for the duration."
+   },
+   {
+    "q": "Why not simply add nodes when disks fill up?",
+    "a": "The move itself needs headroom and bandwidth. Expansion should be triggered by the forecast, well before disks pass about 70%."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "A1-17",
+  "topic": "hosting",
+  "q": "What network and disks would you buy for the cluster, and why?",
+  "mid": "Local NVMe for data nodes, SSDs for metadata, and HDDs only for capacity tiers such as object storage or backups. At least 10 GbE and preferably 25 GbE, because traffic between nodes is heavy in an MPP system.",
+  "senior": "East-west traffic dominates: shuffles, replica copies, repair after failures and, in shared-data mode, every cache miss. 10 GbE is 1.25 GB/s and 25 GbE about 3.1 GB/s, while one PCIe 4.0 x4 NVMe drive has an interface ceiling near 8 GB/s, so in shared-data designs the network becomes the bottleneck long before the disks. I would bond dual ports to two top-of-rack switches with one consistent MTU, put metadata logs on low-latency fsync devices, use JBOD when the database replicates (ClickHouse docs also describe RAID with double replication), and buy mixed-use flash because compaction multiplies writes.",
+  "followups": [
+   {
+    "q": "StarRocks recommends 10 GbE. Why buy 25?",
+    "a": "10 GbE is the documented recommendation and fine for small shared-nothing clusters. 25 GbE shortens repair windows and leaves room for shared-data later, and the price difference is small next to the whole cluster (my view)."
+   },
+   {
+    "q": "What disk gotcha catches people?",
+    "a": "Free space. Merges and compaction must write new parts before deleting old ones, so a disk at 90% is already in trouble."
+   }
+  ],
+  "level": "deep"
+ },
+ {
+  "id": "A1-18",
+  "topic": "hosting",
+  "q": "What does the team now own that a managed warehouse and managed Airflow used to handle?",
+  "mid": "Hardware, OS patching, database upgrades, the high-availability design, backups and disaster recovery, security integration, secrets, monitoring and on-call. Capacity has to be bought ahead because hardware has lead times.",
+  "senior": "At under 40 TB, people cost more than hardware: every stateful system (the MPP engine, the object store, the catalog and its Postgres, Keeper or FoundationDB, the orchestrator, the GPU farm) needs an owner who can be paged. So I would standardise on one primary serving engine, automate provisioning and upgrades, keep runbooks, buy commercial support for the critical path where affordable, and write down the RPO and RTO the business agreed. Per-team attribution from query logs replaces the cost visibility that Snowflake credits used to give.",
+  "followups": [
+   {
+    "q": "What would you ask the colo or hardware vendor?",
+    "a": "Rack power and cooling, since GPU servers can draw several kilowatts each; the part-replacement SLA and on-site spares; remote hands and BMC access; dual switches and carrier diversity; lead times; and how disks are wiped at end of life."
+   },
+   {
+    "q": "How would you keep a small team from drowning?",
+    "a": "Limit the number of distinct stateful systems, automate provisioning and upgrades, rehearse failure drills, and prefer components with commercial support on the critical path."
+   }
+  ],
+  "level": "deep"
+ }
+]
